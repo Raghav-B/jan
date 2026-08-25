@@ -1357,11 +1357,16 @@ async fn proxy_request(
 
                 let request_value = serde_json::Value::Object(completion_map);
 
+                // The proxy serves an OpenAI-compatible client, not a
+                // configured agent run: no settings surface to size a retry
+                // policy and no channel to report attempts on, so it keeps the
+                // pre-#8781 behaviour of one resend for a dropped connection.
                 let completion = match call_openai_chat_completions(
                     &client,
                     &upstream_url,
                     &session_api_keys,
                     &request_value,
+                    crate::core::agent::upstream::RetryPolicy::legacy(),
                 )
                 .await
                 {

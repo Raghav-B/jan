@@ -3810,6 +3810,26 @@ impl App {
                 self.starting.clear();
                 self.turn = (index, max);
             }
+            StreamEvent::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                reason,
+            } => {
+                // A retry is a transport-level pause before the next attempt
+                // resends the identical request, not new reasoning, so surface
+                // it as an app note. An invisible retry loop would be
+                // indistinguishable from a hang (#8710); reasoning that
+                // preceded the retry is display-only and never rejoins the
+                // assistant content, so flushing it here keeps the note from
+                // interleaving inside a half-rendered assistant row without
+                // losing anything the model later resends.
+                self.flush_assistant();
+                let reason = truncate(&reason, 120);
+                self.note(&format!(
+                    "retrying {attempt}/{max} in {delay_ms}ms: {reason}"
+                ));
+            }
             StreamEvent::ToolCallStarted { id, name } => {
                 // Commit buffered prose/reasoning so it renders above the
                 // in-progress throbber, matching the grouped-call ordering.
@@ -17664,6 +17684,7 @@ mod tests {
                 std::collections::HashMap::new();
             let args = std::sync::Arc::new(super::OrchestrationArgs {
                 client: crate::core::agent::upstream::agent_http_client(),
+                retry: crate::core::agent::upstream::RetryPolicy::default(),
                 provider_configs: std::sync::Arc::new(tokio::sync::Mutex::new(
                     provider_configs,
                 )),

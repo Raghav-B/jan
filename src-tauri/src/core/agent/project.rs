@@ -120,6 +120,16 @@ pub(crate) struct AgentSection {
     /// out of the context budget.
     #[serde(default)]
     pub send_reasoning: Option<bool>,
+    /// Transport and answerless-completion retries for a turn, counted as
+    /// attempts after the first failure. Unset applies `DEFAULT_MAX_RETRIES`;
+    /// an explicit `0` disables retrying entirely, which is a real setting and
+    /// not the same as the key being absent.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Base delay in milliseconds before the first retry, doubled per attempt
+    /// and jittered. Unset applies `DEFAULT_RETRY_BACKOFF_MS`.
+    #[serde(default)]
+    pub retry_backoff_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -162,6 +172,8 @@ const AGENT_TOML_TEMPLATE: &str = r#"[agent]
 # show_reasoning = false  # expand  reasoning in the transcript (Ctrl-O still toggles)
 # send_reasoning = true  # resend prior reasoning to the model; false drops it from the request
 #                        # (a provider that rejects the field is detected and stripped automatically)
+# max_retries = 10  # attempts after the first failure (send error, retryable status, or an answerless turn); 0 disables retrying
+# retry_backoff_ms = 250  # base delay before the first retry, in ms; doubled per attempt with jitter
 
 # Project-local provider override. Wins over ~/.jan/config.toml and any
 # provider inherited from Jan Desktop's settings.json. Most projects don't

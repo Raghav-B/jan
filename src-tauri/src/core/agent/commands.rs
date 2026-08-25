@@ -78,6 +78,13 @@ fn build_orchestration_args<R: Runtime>(
         run_mode: crate::core::agent::plan::RunMode::Normal,
         session_id: None,
         sandbox: None,
+        // Desktop keeps the pre-#8781 retry: one resend of a dropped
+        // connection. The broader policy is deliberately CLI-only, because it
+        // ships with the `[agent]` settings that size it and the TUI line that
+        // makes each attempt visible -- neither of which the desktop surface
+        // has, and an unconfigurable ten-attempt loop the user cannot see is
+        // worse than the failure it papers over.
+        retry: crate::core::agent::upstream::RetryPolicy::legacy(),
     }
 }
 

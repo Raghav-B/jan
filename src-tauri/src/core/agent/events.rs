@@ -19,6 +19,22 @@ pub enum StreamEvent {
     /// A new orchestration turn began (`index` is 1-based; `max` is the turn
     /// cap, `0` when the run is unbounded, which is the normal case).
     Step { index: u32, max: u32 },
+    /// A failed attempt is about to be resent. Emitted before the backoff sleep
+    /// so the wait is visible rather than reading as a hang: `attempt` is the
+    /// 1-based number of the retry about to run, `max` the configured ceiling
+    /// (`[agent].max_retries`), `delay_ms` the backoff already computed for it,
+    /// and `reason` the upstream failure being retried.
+    ///
+    /// Only ever emitted for an attempt that committed nothing -- no content
+    /// streamed into the transcript and no tool call executed -- so a consumer
+    /// can treat it as "the last attempt left no trace" and not as a partial
+    /// result being discarded.
+    Retrying {
+        attempt: u32,
+        max: u32,
+        delay_ms: u64,
+        reason: String,
+    },
     /// A tool call started streaming: emitted mid-stream the instant the model's
     /// tool-call `id` and `name` are known, before its arguments finish
     /// streaming. Lets a consumer show an in-progress indicator during the

@@ -105,6 +105,14 @@ pub(crate) struct OrchestrationArgs {
     /// by dispatched subagents via the cloned parent args, so a child shell is
     /// confined exactly as its parent's was.
     pub sandbox: Option<bool>,
+    /// The retry policy every model call in this run uses: how many times a
+    /// send error, retryable status, or answerless completion is resent with
+    /// byte-identical request bytes. Resolved once at run start from
+    /// `[agent].max_retries` / `[agent].retry_backoff_ms`; a mid-run edit
+    /// affects the *next* run only. Inherited by dispatched subagents via the
+    /// cloned parent args, so a child hitting a rate limit gets the same
+    /// resilience as its parent.
+    pub retry: crate::core::agent::upstream::RetryPolicy,
 }
 
 #[async_trait]
@@ -114,6 +122,23 @@ pub(crate) trait ModelInvoker: Send + Sync {
         request: &serde_json::Value,
         events: &mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<serde_json::Value, String>;
+
+    /// Whether an answerless completion should fail the turn rather than being
+    /// handed back as a blank success (the #8781 backstop). Defaults to `true`:
+    /// a surface that never opts out gets the fix, and every mock invoker in
+    /// the tests exercises the guarded path.
+    ///
+    /// The one surface that opts out is the HTTP invoker running the pre-#8781
+    /// retry policy -- the desktop app and the OpenAI-compatible proxy. Those
+    /// have no retry settings and no attempt counter, and turning a blank-but-
+    /// valid `200` into an error there would change an established contract
+    /// (the desktop chat would start erroring where it used to show an empty
+    /// turn; the proxy would answer `502` where it used to answer `200`).
+    /// Scoping the retry engine without scoping this too would leave those
+    /// surfaces with a behaviour that is neither the old one nor the new one.
+    fn fails_answerless_turns(&self) -> bool {
+        true
+    }
 }
 
 /// One tool call's outcome: `content` is the model-facing result string,
@@ -149,6 +174,7 @@ struct HttpModelInvoker {
     client: Client,
     upstream_url: String,
     api_keys: Vec<String>,
+    retry: crate::core::agent::upstream::RetryPolicy,
 }
 
 #[async_trait]
@@ -164,8 +190,16 @@ impl ModelInvoker for HttpModelInvoker {
             &self.api_keys,
             request,
             events,
+            self.retry,
         )
         .await
+    }
+
+    /// Deferred to the resolved retry policy: the configurable CLI/TUI policy
+    /// wants the backstop, the legacy desktop/proxy policy keeps the old
+    /// blank-turn-as-success contract.
+    fn fails_answerless_turns(&self) -> bool {
+        self.retry.retries_answerless()
     }
 }
 
@@ -996,6 +1030,10 @@ pub(crate) async fn run_server_side_openai_orchestration(
         run_mode: crate::core::agent::plan::RunMode::Normal,
         session_id: None,
         sandbox: None,
+        // Same reasoning as the non-streaming proxy path: an HTTP client is not
+        // a configured agent run, so it keeps the pre-#8781 single resend
+        // rather than inheriting the CLI's configurable policy.
+        retry: crate::core::agent::upstream::RetryPolicy::legacy(),
     };
     let body = match json_body.get("max_turns") {
         Some(_) => std::borrow::Cow::Borrowed(json_body),
@@ -1237,6 +1275,7 @@ async fn orchestrate_inner(
         run_mode,
         session_id,
         sandbox,
+        retry,
     } = args;
 
     // Per-turn override: the TUI toggles plan mode live via the request body
@@ -1505,6 +1544,7 @@ async fn orchestrate_inner(
         client: client.clone(),
         upstream_url,
         api_keys: session_api_keys,
+        retry: *retry,
     };
     let mcp_tools = McpToolInvoker {
         tool_to_server,
@@ -1715,6 +1755,7 @@ pub(crate) async fn compact_history(
         client: args.client.clone(),
         upstream_url,
         api_keys,
+        retry: args.retry,
     };
     Ok(crate::core::agent::compaction::compact_conversation(
         messages,
@@ -1749,6 +1790,7 @@ pub(crate) async fn evaluate_goal(
         client: args.client.clone(),
         upstream_url,
         api_keys,
+        retry: args.retry,
     };
     crate::core::agent::goal::evaluate(smol_model_id, condition, messages, &model).await
 }
@@ -1962,6 +2004,32 @@ async fn run_turn_cycle(
                     turn += 1;
                     continue;
                 }
+            }
+            // A turn that came back with neither content nor tool calls would
+            // otherwise end silently blank, leaving the user staring at an
+            // empty turn they have to retype (the bug in #8781 and #8712).
+            // Guard, not retry: the byte-identical retry lives inside
+            // `stream_openai_chat_completions`, so by the time an answerless
+            // completion reaches here the retries are already spent (or the
+            // invoker is not the HTTP one at all -- a mock, or a local engine).
+            // Returning `Err` is replay-safe: no tool call was executed on this
+            // path, so nothing was committed that a retry would duplicate.
+            // Reasoning content emitted before this point is display-only and
+            // never joins the assistant `content` resent as history, so it does
+            // not block this.
+            //
+            // Asked of the invoker rather than applied unconditionally: the
+            // desktop app and the OpenAI-compatible proxy run the pre-#8781
+            // policy and keep returning the blank turn as a success, because
+            // erroring there would change a contract those surfaces cannot
+            // configure their way out of. See `fails_answerless_turns`.
+            if model.fails_answerless_turns()
+                && crate::core::agent::upstream::completion_is_answerless(&completion)
+            {
+                return Err(
+                    "The model returned no answer (empty completion with no tool calls)."
+                        .to_string(),
+                );
             }
             let _ = events.send(StreamEvent::MessagesUpdated {
                 messages: conversation_messages.clone(),
@@ -3407,6 +3475,143 @@ mod tests {
             .unwrap();
 
         assert_eq!(result["choices"][0]["message"]["content"], "done");
+    }
+    /// The #8781/{8712} bug: a completion with neither content nor tool calls
+    /// ends the turn silently blank, leaving the user staring at an empty turn
+    /// they have to retype. The loop must surface it as a real error, not
+    /// return it as a successful `Ok`. The retry with byte-identical request
+    /// bytes lives in the HTTP invoker; this guard exists so a turn can never
+    /// end blank regardless of which invoker produced the completion.
+    #[tokio::test]
+    async fn answerless_completion_fails_the_turn_with_a_user_legible_error() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let model = MockModel::new(vec![
+            json!({ "choices": [{ "message": {}, "finish_reason": "stop" }] }),
+        ]);
+        let tool = MockTool::default();
+        let mut budget = SessionBudget::new(None);
+        let convo = vec![json!({ "role": "user", "content": "hi" })];
+
+        let err = run_turn_cycle(
+            &tx,
+            &json!({}),
+            "m",
+            &[],
+            convo,
+            8,
+            &mut budget,
+            &model,
+            &tool,
+            crate::core::agent::plan::RunMode::Normal,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.contains("returned no answer")
+                && err.contains("no tool calls"),
+            "error must read like a real upstream failure, got: {err}"
+        );
+        assert!(
+            tool.calls.lock().unwrap().is_empty(),
+            "an answerless completion must not execute any tool call"
+        );
+    }
+
+    /// A mock standing in for the surfaces that run the pre-#8781 retry
+    /// policy: the desktop app and the OpenAI-compatible proxy. It answers
+    /// `fails_answerless_turns` the way `HttpModelInvoker` does under
+    /// `RetryPolicy::legacy()`.
+    struct LegacyPolicyModel(MockModel);
+    #[async_trait]
+    impl ModelInvoker for LegacyPolicyModel {
+        async fn invoke(
+            &self,
+            request: &serde_json::Value,
+            events: &mpsc::UnboundedSender<StreamEvent>,
+        ) -> Result<serde_json::Value, String> {
+            self.0.invoke(request, events).await
+        }
+        fn fails_answerless_turns(&self) -> bool {
+            crate::core::agent::upstream::RetryPolicy::legacy().retries_answerless()
+        }
+    }
+
+    /// The other side of the scoping decision, pinned so it cannot drift: on a
+    /// surface running the legacy policy, a blank turn stays the `Ok` it was
+    /// before #8781. Those surfaces have no settings row to size a retry
+    /// budget and no attempt counter to render, so turning a valid-but-empty
+    /// `200` into a hard error there would swap one unconfigurable behaviour
+    /// for another -- the desktop chat erroring where it used to show an empty
+    /// turn, the proxy answering `502` where it used to answer `200`.
+    #[tokio::test]
+    async fn a_legacy_policy_surface_keeps_returning_the_blank_turn_as_success() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let model = LegacyPolicyModel(MockModel::new(vec![
+            json!({ "choices": [{ "message": {}, "finish_reason": "stop" }] }),
+        ]));
+        let tool = MockTool::default();
+        let mut budget = SessionBudget::new(None);
+        let convo = vec![json!({ "role": "user", "content": "hi" })];
+
+        let completion = run_turn_cycle(
+            &tx,
+            &json!({}),
+            "m",
+            &[],
+            convo,
+            8,
+            &mut budget,
+            &model,
+            &tool,
+            crate::core::agent::plan::RunMode::Normal,
+            None,
+            None,
+        )
+        .await
+        .expect("the legacy surfaces hand the blank turn back as a success");
+
+        assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+        assert!(
+            tool.calls.lock().unwrap().is_empty(),
+            "no tool call is executed on a blank turn either way"
+        );
+    }
+
+    /// A completion WITH tool calls must be unaffected by the answerless
+    /// guard: the loop executes the tools and keeps going.
+    #[tokio::test]
+    async fn completion_with_tool_calls_is_unaffected_by_the_guard() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let model = MockModel::new(vec![
+            tool_call_completion(),
+            json!({ "choices": [{ "message": { "content": "final answer" }, "finish_reason": "stop" }] }),
+        ]);
+        let tool = MockTool::default();
+        let mut budget = SessionBudget::new(None);
+        let convo = vec![json!({ "role": "user", "content": "hi" })];
+
+        let result = run_turn_cycle(
+            &tx,
+            &json!({}),
+            "m",
+            &[],
+            convo,
+            8,
+            &mut budget,
+            &model,
+            &tool,
+            crate::core::agent::plan::RunMode::Normal,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["choices"][0]["message"]["content"], "final answer");
+        assert_eq!(tool.calls.lock().unwrap().len(), 1, "one tool call executed");
     }
 
     #[test]

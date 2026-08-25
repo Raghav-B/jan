@@ -595,7 +595,17 @@ pub(crate) async fn call_openai_chat_completions(
     upstream_url: &str,
     api_keys: &[String],
     body: &serde_json::Value,
+    retry: RetryPolicy,
 ) -> Result<serde_json::Value, String> {
+    // The desktop proxy hands this completion back to an OpenAI-compatible
+    // client (the Jan API server), not to the agent loop. So it deliberately
+    // does NOT get the answerless-completion retry below: turning an
+    // empty-but-valid 200 into an error would change that surface's contract
+    // (the client asked for a completion and got one). The agent loop never
+    // calls this path anyway - it always streams. Transport/status retries
+    // still apply, because a dropped connect or a 429 is indistinguishable
+    // from the streaming path's and nothing has been committed to any client
+    // at that point.
     let attempts: Vec<Option<&str>> = if api_keys.is_empty() {
         vec![None]
     } else {
@@ -603,41 +613,89 @@ pub(crate) async fn call_openai_chat_completions(
     };
 
     let mut last_err = String::new();
-    for (i, key_ref) in attempts.iter().enumerate() {
-        let mut req = client
-            .post(upstream_url)
-            .header("Content-Type", "application/json")
-            .header("Accept-Encoding", "identity");
+    let mut retries_used: u32 = 0;
+    loop {
+        // Retry-After belongs to this attempt's last response; a break driven
+        // by a send error produced no new response, so a stale value from an
+        // earlier attempt must not leak into this retry's delay.
+        let mut retry_after: Option<std::time::Duration> = None;
+        for (i, key_ref) in attempts.iter().enumerate() {
+            let mut req = client
+                .post(upstream_url)
+                .header("Content-Type", "application/json")
+                .header("Accept-Encoding", "identity");
 
-        if let Some(key) = key_ref {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
+            if let Some(key) = key_ref {
+                req = req.header("Authorization", format!("Bearer {key}"));
+            }
 
-        let resp = send_with_one_retry(req.body(body.to_string())).await?;
+            let resp = match send_once(req.body(body.to_string()), retry.causes).await {
+                Ok(resp) => resp,
+                Err((desc, retryable)) => {
+                    // A send error means no response arrived, so nothing was
+                    // handed to the client and replaying is safe. A non-retryable
+                    // send error (bytes already flowed: is_body/is_decode, or a
+                    // deterministic is_builder) is fatal on the spot.
+                    if retryable {
+                        last_err = desc;
+                        break;
+                    }
+                    return Err(desc);
+                }
+            };
 
-        let status = resp.status();
-        let text = resp.text().await.map_err(|e| {
-            format!(
-                "Reading the upstream response failed ({upstream_url}): {}",
-                describe_request_error(&e)
-            )
-        })?;
+            let status = resp.status();
+            if !status.is_success() {
+                // Headers are borrowed from the response; text() consumes it, so
+                // capture Retry-After before reading the body.
+                retry_after = retry_after_delay(resp.headers());
+                let text = resp.text().await.map_err(|e| {
+                    format!(
+                        "Reading the upstream response failed ({upstream_url}): {}",
+                        describe_request_error(&e)
+                    )
+                })?;
+                last_err = format!("Upstream returned HTTP {status}: {text}");
+                if is_context_overflow_body(&text) {
+                    // Fatal for the same reason as the streaming path: an
+                    // overflow is deterministic, so resending the identical
+                    // bytes cannot succeed and would spend the whole budget
+                    // failing. The caller reacts to the marker instead.
+                    last_err = format!("[{CONTEXT_OVERFLOW_MARKER}] {last_err}");
+                    return Err(last_err);
+                }
+                if http_status_indicates_api_key_retry(status) && i + 1 < attempts.len() {
+                    log::warn!("OpenAI completion: HTTP {status} with API key index {i}, trying next key");
+                    continue;
+                }
+                if is_retryable_status(status, retry.causes) {
+                    break;
+                }
+                return Err(last_err);
+            }
 
-        if status.is_success() {
+            let text = resp.text().await.map_err(|e| {
+                format!(
+                    "Reading the upstream response failed ({upstream_url}): {}",
+                    describe_request_error(&e)
+                )
+            })?;
             return serde_json::from_str::<serde_json::Value>(&text)
                 .map_err(|e| format!("Failed to parse upstream JSON: {e}. Body: {text}"));
         }
 
-        last_err = format!("Upstream returned HTTP {status}: {text}");
-        if http_status_indicates_api_key_retry(status) && i + 1 < attempts.len() {
-            log::warn!("OpenAI completion: HTTP {status} with API key index {i}, trying next key");
-            continue;
+        if !retry.allows(retries_used) {
+            return Err(retry_exhausted_message(&last_err, retries_used));
         }
-
-        return Err(last_err);
+        let delay = retry.delay(retries_used, retry_after);
+        log::warn!(
+            "OpenAI completion: {last_err}; retrying in {}ms (attempt {retries_used}/{})",
+            delay.as_millis(),
+            retry.max_retries
+        );
+        tokio::time::sleep(delay).await;
+        retries_used += 1;
     }
-
-    Err(last_err)
 }
 
 /// Streaming counterpart of [`call_openai_chat_completions`]. Forces `stream:true`
@@ -720,16 +778,29 @@ fn error_source_chain(err: &dyn std::error::Error) -> Vec<String> {
     chain
 }
 
-/// True when a failed send can be retried safely: the connection died before any
-/// response arrived, so nothing has been streamed to the caller and no side
-/// effect on the upstream is implied. Covers a refused/failed connect and the
-/// stale-keep-alive family -- hyper reports a pooled connection the peer had
-/// already closed as `connection closed before message completed`, or as an
-/// `ECONNRESET`/`EPIPE` io error if the RST lands while the request is going
-/// out. A timeout is deliberately excluded: retrying one doubles the wait.
-fn is_retryable_send_error(err: &reqwest::Error) -> bool {
-    if err.is_timeout() || err.is_body() || err.is_decode() || err.is_builder() {
+/// True when a failed send can be retried safely: the request never produced a
+/// response, so nothing has been streamed to the caller and no side effect on
+/// the upstream is implied.
+///
+/// Covers a refused/failed connect and the stale-keep-alive family -- hyper
+/// reports a pooled connection the peer had already closed as `connection
+/// closed before message completed`, or as an `ECONNRESET`/`EPIPE` io error if
+/// the RST lands while the request is going out.
+///
+/// A timeout counts only under [`RetryCauses::All`], and only because of how
+/// this client is built: [`agent_http_client`] sets a *connect* timeout and
+/// deliberately no overall request timeout, so a timeout here means the
+/// connection was never established -- the request bytes never reached the
+/// upstream. `is_body` and `is_decode` stay excluded under every policy: those
+/// mean bytes already flowed, so a replay could duplicate work the upstream
+/// already did. `is_builder` is a deterministic local mistake that a resend
+/// cannot fix.
+fn is_retryable_send_error(err: &reqwest::Error, causes: RetryCauses) -> bool {
+    if err.is_body() || err.is_decode() || err.is_builder() {
         return false;
+    }
+    if err.is_timeout() {
+        return causes == RetryCauses::All;
     }
     err.is_connect() || chain_indicates_dropped_connection(&error_source_chain(err))
 }
@@ -754,43 +825,238 @@ fn chain_indicates_dropped_connection(chain: &[String]) -> bool {
         })
 }
 
-/// How long to wait before the one retry of a dropped connection. Long enough
-/// for a load balancer that just recycled a backend to finish, short enough that
-/// the user does not read it as a hang.
-const SEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+/// HTTP statuses worth resending the identical request for. All three are
+/// "come back later" signals from a healthy-but-busy path -- rate limiting and
+/// the load-balancer family -- and all arrive as response *headers*, before a
+/// single SSE byte is consumed, so nothing has been committed when one lands.
+///
+/// Deliberately narrow: a 500 is usually a deterministic provider bug that
+/// replays identically, and a 4xx other than 429 is the request's own fault.
+///
+/// Never retried under [`RetryCauses::DroppedConnectionOnly`], which predates
+/// any status-driven retry.
+fn is_retryable_status(status: reqwest::StatusCode, causes: RetryCauses) -> bool {
+    causes == RetryCauses::All && matches!(status.as_u16(), 429 | 502 | 503 | 504)
+}
 
-/// Send a request, retrying it once when the connection dropped before any
-/// response arrived. This is the failure a long turn invites: while tools run
-/// locally no bytes flow, an idle keep-alive connection is reclaimed by the peer
-/// or its load balancer, and the next turn's request is written into a socket
-/// that is already gone. Retrying is safe precisely because nothing was received
-/// -- see [`is_retryable_send_error`].
-async fn send_with_one_retry(req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
-    // `try_clone` returns `None` only for a streaming body; every caller here
-    // sends a `String`, so the retry path is always available in practice.
-    let retry = req.try_clone();
-    let first = match req.send().await {
-        Ok(resp) => return Ok(resp),
-        Err(e) => e,
+/// The upstream's own `Retry-After`, when it names one. Both wire forms are
+/// accepted: delay-seconds (overwhelmingly what OpenAI-compatible upstreams
+/// send) and the fractional-seconds some gateways emit. An HTTP-date is not
+/// parsed -- it needs a clock-skew-tolerant date parser for a form this traffic
+/// does not use -- and falls back to computed backoff.
+///
+/// Capped: a provider asking for an hour must not strand the run in an
+/// invisible sleep, and the cap keeps the wait inside what a user will sit
+/// through while still respecting the signal's intent.
+fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    const MAX_HONOURED: u64 = 60_000;
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: f64 = raw.trim().parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    let ms = (secs * 1000.0).round() as u64;
+    Some(std::time::Duration::from_millis(ms.min(MAX_HONOURED)))
+}
+
+/// Which failure classes a policy resends for.
+///
+/// The broad set is a CLI/TUI capability, not a global one: it ships together
+/// with the `[agent]` settings that size it (`max_retries`,
+/// `retry_backoff_ms`) and the TUI line that makes each attempt visible. The
+/// desktop app and the OpenAI-compatible proxy expose neither, so they keep
+/// the narrow pre-#8781 behaviour rather than silently inheriting a
+/// ten-attempt loop their users can neither see nor turn off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryCauses {
+    /// Every cause proven safe to resend: a dropped or refused connection, a
+    /// request timeout, HTTP 429/502/503/504, and an answerless 200.
+    All,
+    /// Only a connection that failed or was dropped before any response
+    /// arrived -- exactly what `send_with_one_retry` covered before #8781.
+    /// Timeouts, statuses, and answerless completions stay fatal.
+    DroppedConnectionOnly,
+}
+
+/// How many times a failed attempt is resent, how long the waits between them
+/// grow, and which failures qualify. `max_retries` and `backoff_ms` are the
+/// resolved form of the user-facing `[agent].max_retries` and
+/// `[agent].retry_backoff_ms`; `causes` is set by the surface, not the user.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetryPolicy {
+    /// Attempts *after* the first failure. `0` disables retrying entirely,
+    /// which is a supported setting and not the same as leaving the key unset
+    /// (unset resolves to [`DEFAULT_MAX_RETRIES`]).
+    pub max_retries: u32,
+    /// First backoff, doubled per attempt and jittered. `0` retries with no
+    /// wait beyond the jitter floor.
+    pub backoff_ms: u64,
+    /// Private so a caller cannot widen its own retry surface by accident:
+    /// pick a constructor that names the intent instead.
+    causes: RetryCauses,
+}
+
+/// Attempts after the first failure when `[agent].max_retries` is unset. High
+/// enough to ride out a provider's rate-limit window or a load balancer
+/// recycling a backend, which is the failure this exists for; the run stays
+/// interruptible throughout, so the ceiling is not a commitment to wait.
+pub(crate) const DEFAULT_MAX_RETRIES: u32 = 10;
+
+/// First backoff when `[agent].retry_backoff_ms` is unset. Long enough for a
+/// just-recycled backend to come back, short enough that the user does not read
+/// the first retry as a hang.
+pub(crate) const DEFAULT_RETRY_BACKOFF_MS: u64 = 250;
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self::configurable(DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF_MS)
+    }
+}
+
+impl RetryPolicy {
+    /// The policy the CLI resolves from `[agent]`: every safe cause retried,
+    /// with the user's own attempt count and base delay.
+    pub(crate) fn configurable(max_retries: u32, backoff_ms: u64) -> Self {
+        Self {
+            max_retries,
+            backoff_ms,
+            causes: RetryCauses::All,
+        }
+    }
+
+    /// The pre-#8781 behaviour, for surfaces with no retry settings and no
+    /// place to show an attempt counter: one resend, only for a connection
+    /// that never delivered a response. The 250ms base is now jittered to
+    /// `[125ms, 250ms]` instead of fixed, which is the one deliberate
+    /// difference -- it costs nothing at a single attempt and desynchronises
+    /// many clients retrying one provider at once.
+    pub(crate) fn legacy() -> Self {
+        Self {
+            max_retries: 1,
+            backoff_ms: DEFAULT_RETRY_BACKOFF_MS,
+            causes: RetryCauses::DroppedConnectionOnly,
+        }
+    }
+
+    /// Whether a blank-but-successful completion is resent, and -- for the
+    /// loop's own backstop -- whether such a completion fails the turn instead
+    /// of being handed back as an empty success. Both follow the same rule:
+    /// only the surfaces that opted into the #8781 behaviour get either.
+    pub(crate) fn retries_answerless(&self) -> bool {
+        self.causes == RetryCauses::All
+    }
+
+    /// Whether an attempt that has already failed `retries_used` times gets
+    /// another go.
+    fn allows(&self, retries_used: u32) -> bool {
+        retries_used < self.max_retries
+    }
+
+    /// Backoff before retry number `retries_used + 1`: the base delay doubled
+    /// per prior retry, capped, then jittered.
+    ///
+    /// Jitter is full-range (`[0.5x, 1.0x]` of the computed delay) because the
+    /// failure this rides out is frequently shared -- several agents hitting one
+    /// rate-limited provider retry in lockstep otherwise, and a synchronised
+    /// herd re-triggers the same 429. `Retry-After`, when the upstream sends
+    /// one, wins outright: it is the provider stating the actual wait.
+    fn delay(&self, retries_used: u32, retry_after: Option<std::time::Duration>) -> std::time::Duration {
+        if let Some(d) = retry_after {
+            return d;
+        }
+        const MAX_BACKOFF_MS: u64 = 30_000;
+        let grown = self
+            .backoff_ms
+            .saturating_mul(1u64 << retries_used.min(16))
+            .min(MAX_BACKOFF_MS);
+        let jittered = if grown == 0 {
+            0
+        } else {
+            use rand::Rng;
+            rand::thread_rng().gen_range(grown / 2..=grown)
+        };
+        std::time::Duration::from_millis(jittered)
+    }
+}
+
+/// Send a request once, mapping a failure to a description and whether resending
+/// the identical bytes is safe under `causes`. The body is a `String` for every
+/// caller here, so the retry path always has a clone available; a body that
+/// cannot be cloned reports as non-retryable rather than being silently
+/// dropped.
+async fn send_once(
+    req: reqwest::RequestBuilder,
+    causes: RetryCauses,
+) -> Result<reqwest::Response, (String, bool)> {
+    match req.send().await {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            let retryable = is_retryable_send_error(&e, causes);
+            Err((
+                format!("Upstream request failed: {}", describe_request_error(&e)),
+                retryable,
+            ))
+        }
+    }
+}
+
+/// The message an exhausted retry budget surfaces, keeping the last upstream
+/// failure verbatim inside it (a test greps for `HTTP 429`). When nothing was
+/// retried (`retries_used == 0`) the original failure is returned untouched --
+/// the transport never gave us a second chance, so editorialising about retries
+/// that did not happen would mislead the user about the likely cause.
+fn retry_exhausted_message(last_err: &str, retries_used: u32) -> String {
+    if retries_used == 0 {
+        last_err.to_string()
+    } else {
+        format!("Upstream failed after {retries_used} retries; last failure: {last_err}")
+    }
+}
+
+/// True when a completion is a blank turn: no tool calls, no content, and a
+/// finish_reason of "stop" or absent. Such a 200 produced nothing the caller
+/// can use, so resending it is safe -- but only when it is truly empty.
+///
+/// The content check is deliberately NOT trimmed: a whitespace-only answer DID
+/// stream Token bytes, and replaying it would duplicate those tokens in the
+/// transcript. "Content empty" must mean "no Token bytes were streamed at all",
+/// which is exactly the condition that makes a replay leave no trace.
+///
+/// A "length" finish is excluded: that is a real truncation the caller detects
+/// and handles separately, not a blank turn, and must not be silently retried.
+///
+/// Reasoning-only turns (reasoning streamed, no content) DO count as blank: the
+/// user asked a question and got no answer, which is the whole defect. Reasoning
+/// is display-only and never joins the assistant `content` that is resent as
+/// history, so replaying one duplicates no transcript bytes.
+pub(crate) fn completion_is_answerless(completion: &serde_json::Value) -> bool {
+    if !extract_tool_calls(completion).is_empty() {
+        return false;
+    }
+    // `content` is a String or Null off the streaming path, but this predicate
+    // also guards the shared loop, where a completion can come from any invoker
+    // -- a local engine or a proxied JSON body may carry OpenAI content-part
+    // arrays. A non-empty array is a real answer; only a missing, null, or
+    // empty-string content is a blank turn.
+    let content_empty = match extract_choice_message(completion).and_then(|m| m.get("content")) {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(serde_json::Value::Array(parts)) => parts.is_empty(),
+        Some(_) => false,
     };
-    let Some(retry) = retry.filter(|_| is_retryable_send_error(&first)) else {
-        return Err(format!(
-            "Upstream request failed: {}",
-            describe_request_error(&first)
-        ));
-    };
-    log::warn!(
-        "upstream: {} -- retrying once",
-        describe_request_error(&first)
-    );
-    tokio::time::sleep(SEND_RETRY_DELAY).await;
-    retry.send().await.map_err(|e| {
-        format!(
-            "Upstream request failed after one retry: {} (first attempt: {})",
-            describe_request_error(&e),
-            describe_request_error(&first)
-        )
-    })
+    if !content_empty {
+        return false;
+    }
+    match completion
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|f| f.as_str())
+    {
+        None | Some("stop") => true,
+        Some(_) => false,
+    }
 }
 
 /// The HTTP client every agent turn goes through. `Client::new()`'s defaults are
@@ -874,7 +1140,15 @@ pub(crate) async fn stream_openai_chat_completions(
     api_keys: &[String],
     body: &serde_json::Value,
     events: &mpsc::UnboundedSender<StreamEvent>,
+    retry: RetryPolicy,
 ) -> Result<serde_json::Value, String> {
+    // The request body is built exactly once, before the retry loop, so every
+    // attempt resends the identical bytes (req_body.to_string()) rather than a
+    // rebuilt request. That, plus tool execution happening only after invoke
+    // returns (in loop.rs), is what keeps resending safe: at every retry
+    // decision below, no tool call has executed and no content has entered the
+    // transcript. A rebuilt body could silently drift across attempts (stream
+    // flags, timestamps), so replay uses the original serialization verbatim.
     let mut req_body = body.clone();
     if let Some(obj) = req_body.as_object_mut() {
         obj.insert("stream".to_string(), serde_json::json!(true));
@@ -891,38 +1165,129 @@ pub(crate) async fn stream_openai_chat_completions(
     };
 
     let mut last_err = String::new();
-    for (i, key_ref) in attempts.iter().enumerate() {
-        let mut req = client
-            .post(upstream_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .header("Accept-Encoding", "identity");
+    let mut retries_used: u32 = 0;
+    loop {
+        // Retry-After is scoped to one outer attempt: reset here so a value
+        // from an earlier attempt can never leak into a delay driven by a send
+        // error or an answerless completion, neither of which produced a new
+        // response. Within a single attempt the most recent non-success
+        // response wins, including across a key rotation -- a Retry-After the
+        // provider just sent is the freshest signal available, whichever key
+        // drew it.
+        let mut retry_after: Option<std::time::Duration> = None;
+        for (i, key_ref) in attempts.iter().enumerate() {
+            let mut req = client
+                .post(upstream_url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .header("Accept-Encoding", "identity");
 
-        if let Some(key) = key_ref {
-            req = req.header("Authorization", format!("Bearer {key}"));
+            if let Some(key) = key_ref {
+                req = req.header("Authorization", format!("Bearer {key}"));
+            }
+
+            let resp = match send_once(req.body(req_body.to_string()), retry.causes).await {
+                Ok(resp) => resp,
+                Err((desc, retryable)) => {
+                    // A send error means no response arrived at all, so nothing
+                    // was streamed and a replay is safe. A non-retryable send
+                    // error means bytes already flowed (is_body / is_decode) or
+                    // the request could never have been sent (is_builder), so
+                    // it is fatal on the spot.
+                    if retryable {
+                        last_err = desc;
+                        break;
+                    }
+                    return Err(desc);
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                match consume_openai_sse(resp, events).await {
+                    Err(e) => {
+                        // An Err from consume_openai_sse surfaces MID-STREAM:
+                        // either the socket died after content had already
+                        // streamed, or a data:{"error":...} object landed.
+                        // Bytes may already be committed to the transcript, so
+                        // resending could duplicate them - treat as fatal, never
+                        // retry.
+                        return Err(e);
+                    }
+                    Ok(completion)
+                        if retry.retries_answerless()
+                            && completion_is_answerless(&completion) =>
+                    {
+                        // A 200 that produced nothing - no content tokens, no
+                        // tool calls, and a "stop" / absent finish - left no
+                        // trace on the transcript, so replaying is safe. Empty
+                        // content means no Token event was ever emitted and no
+                        // tool call means loop.rs executed nothing. Reasoning
+                        // deltas may already have been emitted, but reasoning is
+                        // display-only and never joins the assistant `content`
+                        // resent as history, so it does not block the retry. We
+                        // reach the retry decision below rather than returning
+                        // the blank turn the user would otherwise see.
+                        let fr = completion["choices"][0]
+                            .get("finish_reason")
+                            .and_then(|f| f.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "absent".to_string());
+                        last_err = format!(
+                            "Upstream returned an empty completion (finish_reason: {fr})"
+                        );
+                        break;
+                    }
+                    Ok(completion) => return Ok(completion),
+                }
+            } else {
+                // Headers are borrowed from the response; text() consumes it, so
+                // capture Retry-After before reading the body.
+                retry_after = retry_after_delay(resp.headers());
+                let text = resp.text().await.unwrap_or_default();
+                last_err = format!("Upstream returned HTTP {status}: {text}");
+                if is_context_overflow_body(&text) {
+                    last_err = format!("[{CONTEXT_OVERFLOW_MARKER}] {last_err}");
+                    // A context-overflow body is fatal: loop.rs reacts to it by
+                    // compacting and retrying, so resending the identical bytes
+                    // here would burn the whole budget on a deterministic
+                    // failure. Fail out and let the compaction path own it.
+                    return Err(last_err);
+                }
+                if http_status_indicates_api_key_retry(status) && i + 1 < attempts.len() {
+                    log::warn!("OpenAI stream: HTTP {status} with API key index {i}, trying next key");
+                    continue;
+                }
+                if is_retryable_status(status, retry.causes) {
+                    break;
+                }
+                return Err(last_err);
+            }
         }
 
-        let resp = send_with_one_retry(req.body(req_body.to_string())).await?;
-
-        let status = resp.status();
-        if status.is_success() {
-            return consume_openai_sse(resp, events).await;
+        if !retry.allows(retries_used) {
+            return Err(retry_exhausted_message(&last_err, retries_used));
         }
-
-        let text = resp.text().await.unwrap_or_default();
-        last_err = format!("Upstream returned HTTP {status}: {text}");
-        if is_context_overflow_body(&text) {
-            last_err = format!("[{CONTEXT_OVERFLOW_MARKER}] {last_err}");
-        }
-        if http_status_indicates_api_key_retry(status) && i + 1 < attempts.len() {
-            log::warn!("OpenAI stream: HTTP {status} with API key index {i}, trying next key");
-            continue;
-        }
-
-        return Err(last_err);
+        let delay = retry.delay(retries_used, retry_after);
+        // Emit the wait before sleeping so it is visible rather than reading as
+        // a hang, then sleep asynchronously: this runs inside the spawned run
+        // task, so a blocking std::thread::sleep would stall the TUI render loop
+        // (#8710).
+        let _ = events.send(StreamEvent::Retrying {
+            attempt: retries_used + 1,
+            max: retry.max_retries,
+            delay_ms: delay.as_millis() as u64,
+            reason: last_err.clone(),
+        });
+        log::warn!(
+            "OpenAI stream: {last_err}; retrying in {}ms (attempt {}/{}",
+            delay.as_millis(),
+            retries_used + 1,
+            retry.max_retries
+        );
+        tokio::time::sleep(delay).await;
+        retries_used += 1;
     }
-
-    Err(last_err)
 }
 
 #[derive(Default)]
@@ -1317,17 +1682,31 @@ mod tests {
         assert!(!chain_indicates_dropped_connection(&[]));
     }
 
-    /// A refused connect never reached the peer, so retrying it is safe; a
-    /// timeout is excluded on purpose (retrying one doubles the wait).
+    /// A refused connect never reached the peer, so retrying it is safe under
+    /// every policy. A timeout is retryable too -- and only because of how this
+    /// client is built: [`agent_http_client`] sets a *connect* timeout and no
+    /// overall request timeout, so a timeout means the connection was never
+    /// established and the request bytes never reached the upstream. Resending
+    /// them cannot double-charge the provider, which is why a timeout is no
+    /// longer excluded under [`RetryCauses::All`]. It stays excluded under
+    /// `DroppedConnectionOnly`, which reproduces the pre-#8781 classification
+    /// the desktop and proxy surfaces still run.
     #[tokio::test]
-    async fn a_refused_connect_is_retryable_but_a_timeout_is_not() {
+    async fn a_refused_connect_retries_everywhere_but_a_timeout_only_under_all_causes() {
         let refused = Client::new()
             .post("http://127.0.0.1:1/v1/chat/completions")
             .body("{}")
             .send()
             .await
             .expect_err("loopback port 1 refuses");
-        assert!(is_retryable_send_error(&refused), "{refused}");
+        assert!(
+            is_retryable_send_error(&refused, RetryCauses::All),
+            "{refused}"
+        );
+        assert!(
+            is_retryable_send_error(&refused, RetryCauses::DroppedConnectionOnly),
+            "a refused connect is the one cause the legacy policy retries: {refused}"
+        );
 
         // 10.255.255.1 is a reserved address that black-holes rather than
         // refusing, so the connect attempt hits the timeout instead.
@@ -1340,9 +1719,116 @@ mod tests {
             .send()
             .await
             .expect_err("black-holed address times out");
+        // Best-effort only: 10.255.255.1 black-holes on some hosts but refuses
+        // or routes differently on others, so this may not time out at all. The
+        // assertions below are kept deliberately conditional rather than
+        // flaky; the real, routing-independent defence is the behavioural test
+        // `a_timeout_is_retried_through_the_loop` below, which drives a timeout
+        // produced by a held-open local connection through the retry loop.
         if timed_out.is_timeout() {
-            assert!(!is_retryable_send_error(&timed_out), "{timed_out}");
+            assert!(
+                is_retryable_send_error(&timed_out, RetryCauses::All),
+                "{timed_out}"
+            );
+            assert!(
+                !is_retryable_send_error(&timed_out, RetryCauses::DroppedConnectionOnly),
+                "the legacy policy never retried a timeout: {timed_out}"
+            );
         }
+    }
+
+    /// A request timeout is retried through the real loop: the first connection
+    /// accepts the request and then never writes a response (a genuinely held,
+    /// unanswered connection), so `reqwest` hits the client's overall request
+    /// timeout; the retry lands on the second connection and streams a real
+    /// answer. Deterministic and routing-independent because the timeout comes
+    /// from our own [`Client::builder().timeout`], not from a route-dependent
+    /// black-holed address -- the classification test above stays best-effort
+    /// for that reason, and this test is the actual behavioural defence that a
+    /// timeout is resent and that the resend is announced as a retry.
+    #[tokio::test]
+    async fn a_timeout_is_retried_through_the_loop() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // The first connection reads the request and then holds the socket open
+        // without writing a byte, so the client's request timeout fires. The
+        // second connection answers with a normal stream. Each attempt gets its
+        // own connection, so the timeout cannot be mistaken for an unanswered
+        // pool and the retry is guaranteed to reach the second accept.
+        let served = Arc::new(Mutex::new(0usize));
+        let server_served = served.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    break;
+                };
+                let served = server_served.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 4096];
+                    let _ = conn.read(&mut scratch).await;
+                    let n = {
+                        let mut s = served.lock().await;
+                        *s += 1;
+                        *s
+                    };
+                    if n == 1 {
+                        // Hold the connection open but reply with nothing, so
+                        // the client times out waiting for a response.
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    } else {
+                        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"after timeout\"},\"finish_reason\":\"stop\"}]}\n\n\
+                                   data: [DONE]\n\n";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+                            sse.len()
+                        );
+                        let _ = conn.write_all(resp.as_bytes()).await;
+                        let _ = conn.flush().await;
+                    }
+                });
+            }
+        });
+
+        // A short overall request timeout forces a deterministic timeout on the
+        // held-open first connection, entirely local and routing-independent.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .expect("client");
+
+        let (tx, mut rx) = sink();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let completion = stream_openai_chat_completions(
+            &client,
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::configurable(10, 0),
+        )
+        .await
+        .expect("the timeout is retried into the second stream's answer");
+
+        assert_eq!(
+            completion["choices"][0]["message"]["content"], "after timeout",
+            "the retry landed on the second connection's stream"
+        );
+
+        drop(tx);
+        let mut retries = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Retrying { attempt, .. } = ev {
+                retries.push(attempt);
+            }
+        }
+        assert_eq!(retries, vec![1], "the timeout triggered exactly one retry");
+        server.abort();
     }
 
     /// The failure a long turn invites: the peer reclaims a keep-alive
@@ -1386,6 +1872,7 @@ mod tests {
             &[],
             &json!({ "model": "m", "messages": [] }),
             &tx,
+            RetryPolicy::configurable(10, 0),
         )
         .await
         .expect("the retry carries the turn");
@@ -1402,6 +1889,743 @@ mod tests {
         }
         assert_eq!(tokens, vec!["hi".to_string()], "streamed once, not twice");
         server.await.expect("server task");
+    }
+    /// Rate limiting: the first reply is a 429 with Retry-After: 0 (so the
+    /// wait is a no-op), the second streams a real answer. The loop must resend
+    /// the identical request and surface a `Retrying` event for attempt 1.
+    #[tokio::test]
+    async fn a_429_then_200_retries_and_signals_the_attempt() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // One task per accepted connection, keyed by how many requests have
+        // already come in: the first answers 429, the second streams a real
+        // answer. A per-connection task (rather than sequential accept calls)
+        // guarantees every request is answered, so the test can never hang on
+        // a retry that reuses a pooled connection.
+        let served = Arc::new(Mutex::new(0usize));
+        let server_served = served.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    break;
+                };
+                let served = server_served.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 4096];
+                    let _ = conn.read(&mut scratch).await;
+                    let n = {
+                        let mut s = served.lock().await;
+                        *s += 1;
+                        *s
+                    };
+                    if n == 1 {
+                        // Rate limit, asking not to wait.
+                        let _ = conn
+                            .write_all(
+                                b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n",
+                            )
+                            .await;
+                    } else {
+                        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+                                   data: [DONE]\n\n";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+                            sse.len()
+                        );
+                        let _ = conn.write_all(resp.as_bytes()).await;
+                    }
+                    let _ = conn.flush().await;
+                });
+            }
+        });
+
+        let (tx, mut rx) = sink();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let completion = stream_openai_chat_completions(
+            &Client::new(),
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::configurable(10, 0),
+        )
+        .await
+        .expect("the retry carries the 429 to a 200");
+
+        assert_eq!(completion["choices"][0]["message"]["content"], "ok");
+
+        drop(tx);
+        let mut retries = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Retrying { attempt, .. } = ev {
+                retries.push(attempt);
+            }
+        }
+        assert_eq!(retries, vec![1], "one retry for the 429");
+        server.abort();
+    }
+
+    /// The blank-turn defect: a 200 streams an answerless `stop` completion
+    /// (empty content, no tool calls), which the old code returned as a
+    /// successful turn. It must now retry instead, and the second (real) stream
+    /// wins.
+    #[tokio::test]
+    async fn an_answerless_stop_completion_is_retried_not_returned() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // The first connection returns the blank turn shape (empty content,
+        // finish_reason "stop"); the second streams a real answer. A task per
+        // connection plus `Connection: close` keeps each attempt on its own
+        // accept, so the retry can never block on an unanswered pool.
+        let served = Arc::new(Mutex::new(0usize));
+        let server_served = served.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    break;
+                };
+                let served = server_served.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 4096];
+                    let _ = conn.read(&mut scratch).await;
+                    let n = {
+                        let mut s = served.lock().await;
+                        *s += 1;
+                        *s
+                    };
+                    let sse = if n == 1 {
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: [DONE]\n\n"
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"real answer\"},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: [DONE]\n\n"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+                        sse.len()
+                    );
+                    let _ = conn.write_all(resp.as_bytes()).await;
+                    let _ = conn.flush().await;
+                });
+            }
+        });
+
+        let (tx, mut rx) = sink();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let completion = stream_openai_chat_completions(
+            &Client::new(),
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::configurable(10, 0),
+        )
+        .await
+        .expect("the empty turn is retried into a real answer");
+
+        assert_eq!(completion["choices"][0]["message"]["content"], "real answer");
+
+        drop(tx);
+        let mut retries = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Retrying { attempt, .. } = ev {
+                retries.push(attempt);
+            }
+        }
+        assert_eq!(retries, vec![1], "the blank completion triggered one retry");
+        server.abort();
+    }
+
+    /// Replay safety for a tool-call turn: a request that returned a tool call
+    /// is a committed action -- the caller will execute it with real side
+    /// effects. Resending it would repeat those effects, so the loop must hand
+    /// the first completion back untouched and never issue a second request,
+    /// even though a service that never answered with a tool call would be
+    /// retried. This is the end-to-end proof that backing off a blank turn
+    /// cannot have turned a side-effecting tool call into a double execution.
+    #[tokio::test]
+    async fn a_tool_call_turn_is_never_replayed() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // The first request streams a tool call (empty content, finish_reason
+        // "tool_calls"); any second request streams ordinary text instead. The
+        // turn must never be resent, so `served` stays at 1.
+        let served = Arc::new(Mutex::new(0usize));
+        let server_served = served.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    break;
+                };
+                let served = server_served.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 4096];
+                    let _ = conn.read(&mut scratch).await;
+                    let n = {
+                        let mut s = served.lock().await;
+                        *s += 1;
+                        *s
+                    };
+                    let sse = if n == 1 {
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_scan\",\"function\":{\"name\":\"run_shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                         data: [DONE]\n\n"
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"second stream\"},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: [DONE]\n\n"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+                        sse.len()
+                    );
+                    let _ = conn.write_all(resp.as_bytes()).await;
+                    let _ = conn.flush().await;
+                });
+            }
+        });
+
+        let (tx, mut rx) = sink();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let completion = stream_openai_chat_completions(
+            &Client::new(),
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::configurable(10, 0),
+        )
+        .await
+        .expect("the tool call is returned, not replayed");
+
+        assert_eq!(
+            *served.lock().await, 1,
+            "a tool-call turn is never resent, however many retries are allowed"
+        );
+        let tc = &completion["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_scan", "the first stream's call id survives");
+        assert_eq!(
+            tc["function"]["name"], "run_shell",
+            "the first stream's call name survives"
+        );
+        assert_ne!(
+            completion["choices"][0]["message"]["content"],
+            serde_json::json!("second stream"),
+            "the second stream's content must not leak into the result"
+        );
+
+        drop(tx);
+        let mut retries = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Retrying { attempt, .. } = ev {
+                retries.push(attempt);
+            }
+        }
+        assert_eq!(retries, Vec::<u32>::new(), "no retry was signalled");
+        server.abort();
+    }
+
+    /// Replay safety for a content turn: once the model has streamed answer
+    /// tokens, those bytes are committed to the transcript. Resending would
+    /// duplicate them, so a completion that produced content is returned
+    /// verbatim and never re-requested. Proves committed tokens are never
+    /// duplicated by the configurable retry loop.
+    #[tokio::test]
+    async fn a_turn_that_streamed_content_is_never_replayed() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // The first request streams a real answer; any second request streams
+        // different text. The turn must never be resent, so `served` stays at 1.
+        let served = Arc::new(Mutex::new(0usize));
+        let server_served = served.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    break;
+                };
+                let served = server_served.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 4096];
+                    let _ = conn.read(&mut scratch).await;
+                    let n = {
+                        let mut s = served.lock().await;
+                        *s += 1;
+                        *s
+                    };
+                    let sse = if n == 1 {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"first answer\"},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: [DONE]\n\n"
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"duplicated answer\"},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: [DONE]\n\n"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+                        sse.len()
+                    );
+                    let _ = conn.write_all(resp.as_bytes()).await;
+                    let _ = conn.flush().await;
+                });
+            }
+        });
+
+        let (tx, mut rx) = sink();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let completion = stream_openai_chat_completions(
+            &Client::new(),
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::configurable(10, 0),
+        )
+        .await
+        .expect("the first stream's content is returned, not replayed");
+
+        assert_eq!(
+            *served.lock().await, 1,
+            "a completion that streamed content is never resent"
+        );
+        assert_eq!(
+            completion["choices"][0]["message"]["content"], "first answer",
+            "the returned content is the first stream's, not a duplicate"
+        );
+
+        drop(tx);
+        let mut retries = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Retrying { attempt, .. } = ev {
+                retries.push(attempt);
+            }
+        }
+        assert_eq!(retries, Vec::<u32>::new(), "no retry was signalled");
+        server.abort();
+    }
+
+    /// The scoping guarantee for #8781: the broad retry set is a CLI/TUI
+    /// capability. A surface on [`RetryPolicy::legacy`] -- the desktop app and
+    /// the OpenAI-compatible proxy -- must see a 429 and an answerless 200
+    /// exactly as it did before this feature: a single error, no resend. Retry
+    /// behaviour a user can neither configure nor watch is worse than the
+    /// failure it hides, so it is not switched on for them silently.
+    #[tokio::test]
+    async fn the_legacy_policy_retries_neither_a_429_nor_a_blank_turn() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Mutex;
+
+        // `first` decides what the very first request gets; every later request
+        // streams a real answer. Under the legacy policy nothing should ever
+        // reach that second response, and `served` proves it.
+        async fn serve_once_then_answer(
+            first: String,
+        ) -> (String, Arc<Mutex<usize>>, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let served = Arc::new(Mutex::new(0usize));
+            let server_served = served.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let served = server_served.clone();
+                    let first = first.clone();
+                    tokio::spawn(async move {
+                        let mut scratch = [0u8; 4096];
+                        let _ = conn.read(&mut scratch).await;
+                        let n = {
+                            let mut s = served.lock().await;
+                            *s += 1;
+                            *s
+                        };
+                        if n == 1 {
+                            let _ = conn.write_all(first.as_bytes()).await;
+                        } else {
+                            let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\n\
+                                       data: [DONE]\n\n";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+                                sse.len()
+                            );
+                            let _ = conn.write_all(resp.as_bytes()).await;
+                        }
+                        let _ = conn.flush().await;
+                    });
+                }
+            });
+            (format!("http://{addr}/v1/chat/completions"), served, handle)
+        }
+
+        // A 429 that the configurable policy would ride out.
+        let (url, served, server) = serve_once_then_answer(
+            "HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let (tx, mut rx) = sink();
+        let err = stream_openai_chat_completions(
+            &Client::new(),
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::legacy(),
+        )
+        .await
+        .expect_err("legacy treats a 429 as fatal");
+        assert!(err.contains("HTTP 429"), "names the upstream failure: {err}");
+        assert_eq!(*served.lock().await, 1, "the request was not resent");
+        drop(tx);
+        assert!(
+            !rx.try_recv()
+                .is_ok_and(|ev| matches!(ev, StreamEvent::Retrying { .. })),
+            "no attempt was announced, because none was made"
+        );
+        server.abort();
+
+        // A blank 200: the very defect #8781 fixes, left in place on surfaces
+        // that never opted into the fix.
+        let blank = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                     data: [DONE]\n\n";
+        let blank_resp = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{blank}",
+            blank.len()
+        );
+        let (url, served, server) = serve_once_then_answer(blank_resp).await;
+        let (tx, _rx) = sink();
+        let completion = stream_openai_chat_completions(
+            &Client::new(),
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::legacy(),
+        )
+        .await
+        .expect("legacy returns the blank turn rather than retrying it");
+        assert!(
+            completion_is_answerless(&completion),
+            "the blank turn came back as a success, unretried: {completion}"
+        );
+        assert_eq!(*served.lock().await, 1, "the blank turn was not resent");
+        server.abort();
+    }
+
+    /// A dropped connection is the one cause the legacy policy does resend, and
+    /// it gets exactly one attempt -- the pre-#8781 `send_with_one_retry`
+    /// contract, still intact for the desktop and proxy surfaces.
+    #[tokio::test]
+    async fn the_legacy_policy_still_retries_one_dropped_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("first accept");
+            let mut scratch = [0u8; 1024];
+            let _ = first.read(&mut scratch).await;
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.expect("second accept");
+            let _ = second.read(&mut scratch).await;
+            let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                       data: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+                sse.len()
+            );
+            let _ = second.write_all(resp.as_bytes()).await;
+            let _ = second.flush().await;
+        });
+
+        let (tx, _rx) = sink();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let completion = stream_openai_chat_completions(
+            &Client::new(),
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::legacy(),
+        )
+        .await
+        .expect("one retry still carries a dropped connection");
+
+        assert_eq!(completion["choices"][0]["message"]["content"], "hi");
+        assert_eq!(
+            RetryPolicy::legacy().max_retries,
+            1,
+            "one attempt after the first failure, as before #8781"
+        );
+        server.await.expect("server task");
+    }
+
+    #[test]
+    fn completion_is_answerless_classifies_blank_turns() {
+        // Tool calls with empty content are a real turn, not blank.
+        let tool_turn = json!({
+            "choices": [{
+                "message": { "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": { "name": "read", "arguments": "{}" }
+                }] },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        assert!(!completion_is_answerless(&tool_turn));
+
+        // A "length" finish is a real truncation, handled by the caller.
+        let truncated = json!({
+            "choices": [{ "message": { "content": null }, "finish_reason": "length" }]
+        });
+        assert!(!completion_is_answerless(&truncated));
+
+        // A normal answer is not blank.
+        let normal = json!({
+            "choices": [{ "message": { "content": "hi" }, "finish_reason": "stop" }]
+        });
+        assert!(!completion_is_answerless(&normal));
+
+        // Empty content with a "stop" finish IS the blank turn.
+        let blank = json!({
+            "choices": [{ "message": { "content": null }, "finish_reason": "stop" }]
+        });
+        assert!(completion_is_answerless(&blank));
+
+        // An absent finish_reason is also blank.
+        let no_finish = json!({
+            "choices": [{ "message": { "content": null } }]
+        });
+        assert!(completion_is_answerless(&no_finish));
+
+        // Whitespace-only content streamed bytes, so it is NOT blank: replaying
+        // it would duplicate those tokens.
+        let whitespace = json!({
+            "choices": [{ "message": { "content": "   " }, "finish_reason": "stop" }]
+        });
+        assert!(!completion_is_answerless(&whitespace));
+
+        // Content-part arrays reach this predicate through the shared loop
+        // guard, where completions come from invokers other than the streaming
+        // client. A populated array is a real answer; an empty one is blank.
+        let parts = json!({
+            "choices": [{
+                "message": { "content": [{ "type": "text", "text": "hi" }] },
+                "finish_reason": "stop"
+            }]
+        });
+        assert!(!completion_is_answerless(&parts));
+        let empty_parts = json!({
+            "choices": [{ "message": { "content": [] }, "finish_reason": "stop" }]
+        });
+        assert!(completion_is_answerless(&empty_parts));
+    }
+
+    #[test]
+    fn retry_max_zero_disables_retrying_entirely() {
+        let policy = RetryPolicy::configurable(0, 0);
+        assert!(!policy.allows(0), "no retries allowed when max_retries is 0");
+    }
+
+    /// `max_retries: 0` must fail after exactly one request, with no `Retrying`
+    /// event and no sleep, even when the upstream keeps answering 429.
+    #[tokio::test]
+    async fn a_zero_retry_budget_answers_429_once_and_gives_up() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let count = Arc::new(Mutex::new(0usize));
+        let server_count = count.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    break;
+                };
+                *server_count.lock().await += 1;
+                let mut scratch = [0u8; 4096];
+                let _ = conn.read(&mut scratch).await;
+                let _ = conn
+                    .write_all(
+                        b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                let _ = conn.flush().await;
+            }
+        });
+
+        let (tx, mut rx) = sink();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let err = stream_openai_chat_completions(
+            &Client::new(),
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::configurable(0, 0),
+        )
+        .await
+        .expect_err("a disabled retry budget gives up on the first 429");
+
+        assert!(err.contains("429"), "the upstream status survives: {err}");
+        assert_eq!(*count.lock().await, 1, "exactly one request was sent");
+
+        drop(tx);
+        let mut retries = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Retrying { .. } = ev {
+                retries.push(());
+            }
+        }
+        assert!(retries.is_empty(), "no retry event with a zero budget");
+        server.abort();
+    }
+
+    /// Exhaustion names the upstream failure verbatim: the always-429 server
+    /// must surface as `HTTP 429` inside the exhaustion message.
+    #[tokio::test]
+    async fn retry_exhaustion_surfaces_the_upstream_failure() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let count = Arc::new(Mutex::new(0usize));
+        let server_count = count.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    break;
+                };
+                *server_count.lock().await += 1;
+                let mut scratch = [0u8; 4096];
+                let _ = conn.read(&mut scratch).await;
+                let _ = conn
+                    .write_all(
+                        b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                let _ = conn.flush().await;
+            }
+        });
+
+        let (tx, _rx) = sink();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let err = stream_openai_chat_completions(
+            &Client::new(),
+            &url,
+            &[],
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            RetryPolicy::configurable(2, 0),
+        )
+        .await
+        .expect_err("a permanently-429 upstream exhausts the budget");
+
+        assert!(err.contains("429"), "the upstream failure survives: {err}");
+        assert_eq!(*count.lock().await, 3, "initial attempt plus two retries");
+        server.abort();
+    }
+
+    #[test]
+    fn retry_after_delay_parses_and_caps() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_delay(&headers), None, "no header -> None");
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+        assert_eq!(
+            retry_after_delay(&headers),
+            Some(std::time::Duration::from_millis(2000))
+        );
+
+        // Garbage is not a delay.
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("soon"),
+        );
+        assert_eq!(retry_after_delay(&headers), None);
+
+        // An HTTP-date is not accepted either.
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after_delay(&headers), None);
+
+        // An absurd delay is capped.
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("86400"),
+        );
+        assert_eq!(
+            retry_after_delay(&headers),
+            Some(std::time::Duration::from_millis(60_000))
+        );
+    }
+
+    #[test]
+    fn retry_policy_delay_grows_caps_and_honours_retry_after() {
+        let policy = RetryPolicy::configurable(10, 1000);
+        // Grows with retries_used: attempt 0 -> ~1s band, attempt 3 -> ~8s band.
+        let d0 = policy.delay(0, None).as_millis();
+        let d3 = policy.delay(3, None).as_millis();
+        assert!(d0 >= 500 && d0 <= 1000, "first backoff in [0.5x,1.0x]: {d0}");
+        assert!(d3 >= 4000 && d3 <= 8000, "fourth backoff in [0.5x,1.0x]: {d3}");
+        assert!(d3 > d0, "backoff grows with retries_used");
+
+        // The 30s cap: the computed delay is capped before jittering, so the
+        // result sits in the capped value's jitter band, never above the cap.
+        let big = RetryPolicy::configurable(10, 100_000);
+        let capped = big.delay(10, None).as_millis();
+        assert!(
+            (15_000..=30_000).contains(&capped),
+            "capped backoff in [0.5x,1.0x] of 30s: {capped}"
+        );
+
+        // Retry-After overrides the computed value.
+        let after = std::time::Duration::from_millis(1234);
+        assert_eq!(policy.delay(5, Some(after)), after);
+
+        // Zero backoff stays at zero (no jitter floor).
+        let none = RetryPolicy::configurable(10, 0);
+        assert_eq!(none.delay(7, None).as_millis(), 0);
     }
 
     /// A proxy in the environment breaks Jan and nothing else, and never shows up

@@ -687,6 +687,7 @@ fn build_cli_orchestration_args(
     auto_approve: bool,
     plan: bool,
     max_parallel_subagents: u32,
+    retry: crate::core::agent::upstream::RetryPolicy,
     sandbox: Option<bool>,
 ) -> OrchestrationArgs {
     OrchestrationArgs {
@@ -703,6 +704,7 @@ fn build_cli_orchestration_args(
         system_prompt_override: None,
         subagents_enabled: true,
         max_parallel_subagents,
+        retry,
         auto_approve,
         run_mode: if plan {
             crate::core::agent::plan::RunMode::Plan
@@ -927,6 +929,17 @@ fn prepare_agent_session(
         .agent
         .max_parallel_subagents
         .unwrap_or(crate::core::agent::subagent::DEFAULT_MAX_PARALLEL_SUBAGENTS);
+    // `unwrap_or`, never a truthiness test or `filter(|n| *n > 0)`: an explicit
+    // `0` disables retrying and is a real setting, distinct from the key being
+    // absent. `max_retries` counts attempts after the first failure.
+    let retry = crate::core::agent::upstream::RetryPolicy::configurable(
+        cfg.agent
+            .max_retries
+            .unwrap_or(crate::core::agent::upstream::DEFAULT_MAX_RETRIES),
+        cfg.agent
+            .retry_backoff_ms
+            .unwrap_or(crate::core::agent::upstream::DEFAULT_RETRY_BACKOFF_MS),
+    );
     let args = build_cli_orchestration_args(
         project_root,
         permissions,
@@ -937,6 +950,7 @@ fn prepare_agent_session(
         flags.auto_approve,
         flags.plan,
         max_parallel_subagents,
+        retry,
         flags.sandbox,
     );
 
@@ -1302,6 +1316,23 @@ async fn print_event(ev: StreamEvent, registry: &PermissionRegistry) {
             0 => eprintln!("\n\x1b[2m[turn {index}]\x1b[0m"),
             m => eprintln!("\n\x1b[2m[turn {index}/{m}]\x1b[0m"),
         },
+        // Progress, not answer: dimmed on stderr so piping stdout yields only
+        // the real completion. `attempt` is 1-based, `max` the ceiling.
+        StreamEvent::Retrying {
+            attempt,
+            max,
+            delay_ms,
+            reason,
+        } => {
+            let reason = if reason.chars().count() > 120 {
+                reason.chars().take(117).collect::<String>() + "..."
+            } else {
+                reason
+            };
+            eprintln!(
+                "\x1b[2mretrying {attempt}/{max} in {delay_ms}ms: {reason}\x1b[0m"
+            );
+        }
         // In-progress signal is for the live TUI; the piped log stays quiet
         // until the full call (with args) arrives just below.
         // Headless prints one line per completed call; the in-progress signal
