@@ -8845,6 +8845,20 @@ const AGENT_SETTINGS: &[AgentSettingDef] = &[
         scope: SettingScope::Project,
     },
     AgentSettingDef {
+        key: "max_retries",
+        label: "max_retries",
+        desc: "extra attempts after a failed upstream call; 0 disables retrying",
+        kind: AgentSettingKind::Int { default: Some(10), min: 0 },
+        scope: SettingScope::Project,
+    },
+    AgentSettingDef {
+        key: "retry_backoff_ms",
+        label: "retry_backoff_ms",
+        desc: "base delay between retries, grown exponentially with jitter",
+        kind: AgentSettingKind::Int { default: Some(250), min: 0 },
+        scope: SettingScope::Project,
+    },
+    AgentSettingDef {
         key: "instructions_file",
         label: "instructions_file",
         desc: "markdown injected into the system prompt",
@@ -18371,6 +18385,115 @@ mod tests {
         assert!(err.contains("not an integer"), "{err}");
         assert_eq!(std::fs::read_to_string(&toml_path).unwrap(), "[agent]\n");
         let _ = std::fs::remove_dir_all(&app.agent_dir);
+    }
+    #[test]
+    fn settings_list_surfaces_retry_rows_with_defaults_and_mins() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.agent_dir).unwrap();
+        let toml_path = app.agent_dir.join("agent.toml");
+        std::fs::write(&toml_path, "[agent]\n").unwrap();
+
+        super::settings_command(&mut app, "");
+        let picker = app.picker.as_ref().expect("picker open");
+        // Both rows are in the `/settings` list, unset before any value is
+        // written, and carry the defaults/mins from their defs.
+        let max_retries = picker
+            .items
+            .iter()
+            .find(|i| i.value == "max_retries")
+            .expect("max_retries row present");
+        assert_eq!(max_retries.hint.as_deref(), Some("(unset)"));
+        let backoff = picker
+            .items
+            .iter()
+            .find(|i| i.value == "retry_backoff_ms")
+            .expect("retry_backoff_ms row present");
+        assert_eq!(backoff.hint.as_deref(), Some("(unset)"));
+
+        let max_retries_def = AGENT_SETTINGS.iter().find(|d| d.key == "max_retries").unwrap();
+        match max_retries_def.kind {
+            super::AgentSettingKind::Int { default: Some(10), min: 0 } => {}
+            _ => panic!("max_retries def is not Int(default 10, min 0)"),
+        }
+        let backoff_def = AGENT_SETTINGS
+            .iter()
+            .find(|d| d.key == "retry_backoff_ms")
+            .unwrap();
+        match backoff_def.kind {
+            super::AgentSettingKind::Int {
+                default: Some(250),
+                min: 0,
+            } => {}
+            _ => panic!("retry_backoff_ms def is not Int(default 250, min 0)"),
+        }
+        let _ = std::fs::remove_dir_all(&app.agent_dir);
+    }
+
+    #[test]
+    fn settings_max_retries_zero_persists_as_value_and_clearing_removes_key() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.agent_dir).unwrap();
+        let toml_path = app.agent_dir.join("agent.toml");
+        std::fs::write(&toml_path, "[agent]\n").unwrap();
+
+        // `0` is a real value (retry disabled), not unset, so it round-trips
+        // as an explicit TOML `0` under `[agent]` rather than being dropped.
+        let def = AGENT_SETTINGS.iter().find(|d| d.key == "max_retries").unwrap();
+        app.settings_prompt = Some(super::SettingsPrompt::new(def, None));
+        super::handle_settings_key(&mut app, key(KeyCode::Char('0')), false);
+        super::handle_settings_key(&mut app, key(KeyCode::Enter), false);
+        assert!(app.settings_prompt.is_none());
+        let doc = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(doc.contains("[agent]") && doc.contains("max_retries = 0"), "{doc}");
+        assert!(
+            transcript_text(&app).contains("max_retries = 0 written"),
+            "{}",
+            transcript_text(&app)
+        );
+
+        // Clearing the field removes the key so the default (10) applies.
+        app.settings_prompt = Some(super::SettingsPrompt::new(def, Some("0")));
+        super::handle_settings_key(&mut app, key(KeyCode::Backspace), false);
+        super::handle_settings_key(&mut app, key(KeyCode::Enter), false);
+        assert!(app.settings_prompt.is_none());
+        let doc = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(!doc.contains("max_retries"), "key removed: {doc}");
+        assert!(transcript_text(&app).contains("max_retries unset"));
+        let _ = std::fs::remove_dir_all(&app.agent_dir);
+    }
+
+    #[test]
+    fn retrying_event_pushes_one_note_naming_attempt_max_and_reason() {
+        let mut app = test_app();
+        let before = app.transcript.len();
+        app.apply(StreamEvent::Retrying {
+            attempt: 3,
+            max: 10,
+            delay_ms: 500,
+            reason: "upstream returned 503, retrying".to_string(),
+        });
+        let after = app.transcript.len();
+        // The note is a single row: no diff/prose/panel expansion.
+        assert_eq!(after, before + 1, "exactly one row pushed");
+        let text = row_text(app.transcript.last().unwrap());
+        assert!(text.contains("retrying 3/10 in 500ms"), "row: {text}");
+        assert!(text.contains("upstream returned 503, retrying"), "row: {text}");
+    }
+
+    #[test]
+    fn retrying_reason_is_truncated_to_protect_the_row() {
+        let mut app = test_app();
+        let reason = "x".repeat(500);
+        app.apply(StreamEvent::Retrying {
+            attempt: 1,
+            max: 4,
+            delay_ms: 0,
+            reason: reason.clone(),
+        });
+        let text = row_text(app.transcript.last().unwrap());
+        assert!(text.len() < 200, "truncated row: {}", text.len());
+        assert!(text.contains('…'), "ellipsis marks truncation: {text}");
+        assert!(!text.contains(&reason), "untruncated body leaked: {text}");
     }
 
     #[test]
