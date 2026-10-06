@@ -239,6 +239,20 @@
         "sessionId"
       ]
     },
+    "session/compact": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionIdParams",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sessionId"
+      ]
+    },
     "turn/start": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "TurnStartParams",
@@ -1309,6 +1323,11 @@
       "CompactionReason": {
         "description": "Which path asked for a [`StreamEvent::Compaction`].",
         "oneOf": [
+          {
+            "description": "The host explicitly requested compaction between turns.",
+            "type": "string",
+            "const": "manual"
+          },
           {
             "description": "The request about to be sent was over the window's trigger.",
             "type": "string",

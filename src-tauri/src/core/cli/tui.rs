@@ -6335,6 +6335,7 @@ impl App {
     ) {
         use crate::core::agent::events::{CompactionPhase, CompactionReason};
         let why = match reason {
+            CompactionReason::Manual => "the host requested compaction",
             CompactionReason::Preflight => "the prompt neared the context window",
             CompactionReason::ContextOverflow => "the provider rejected the prompt as too long",
             CompactionReason::SessionBudget => "the session token budget was used up",

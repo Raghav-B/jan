@@ -855,6 +855,11 @@
       "description": "Which path asked for a [`StreamEvent::Compaction`].",
       "oneOf": [
         {
+          "description": "The host explicitly requested compaction between turns.",
+          "type": "string",
+          "const": "manual"
+        },
+        {
           "description": "The request about to be sent was over the window's trigger.",
           "type": "string",
           "const": "preflight"

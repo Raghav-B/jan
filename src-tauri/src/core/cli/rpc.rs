@@ -20,9 +20,9 @@ use super::{
     agent_dir_for, cli_save_thread, load_resume_history, prepare_agent_session, AgentSession,
     ResumeRequest, ResumeTarget, SessionFlags,
 };
-use crate::core::agent::events::{StreamEvent, PROTOCOL_VERSION};
+use crate::core::agent::events::{CompactionPhase, CompactionReason, StreamEvent, PROTOCOL_VERSION};
 use crate::core::agent::host_tools::{HostToolDecl, HostToolResult, HostToolSet};
-use crate::core::agent::r#loop::{run_orchestration_steered, SteeringRequest};
+use crate::core::agent::r#loop::{compact_history, run_orchestration_steered, SteeringRequest};
 
 const OUTPUT_CAPACITY: usize = 1025; // 1024 ordinary records and one reserved terminal outcome.
 const INPUT_CAPACITY: usize = 64;
@@ -546,6 +546,42 @@ fn finish_turn(
     Ok(())
 }
 
+/// Compact one idle RPC session through Jan's native summarizer and persist
+/// the replacement history before exposing it to the live process. A failed
+/// save therefore leaves both the in-memory and on-disk session untouched.
+async fn compact_session(session: &mut Session) -> Result<usize, String> {
+    let original_len = session.history.len();
+    let compacted = compact_history(
+        &session.agent.args,
+        &session.agent.model,
+        &session.history,
+        crate::core::agent::compaction::MANUAL_KEEP_RECENT,
+    )
+    .await?;
+
+    if !session.ephemeral {
+        let project = session
+            .agent
+            .args
+            .project_root
+            .as_ref()
+            .ok_or_else(|| "session has no project root".to_owned())?;
+        cli_save_thread(
+            &agent_dir_for(project),
+            Some(&session.id),
+            &session.agent.model,
+            &compacted,
+            session.agent.args.host_system_prompt.as_ref().map(|prompt| {
+                json!({ super::SYSTEM_PROMPT_KEY: prompt })
+            }),
+        )?;
+    }
+
+    let summarized = original_len.saturating_sub(compacted.len());
+    session.history = compacted;
+    Ok(summarized)
+}
+
 /// One runtime owns many addressable sessions. All writes share one bounded output queue.
 pub async fn serve() -> Result<(), String> {
     let mut input = input_lines();
@@ -593,7 +629,7 @@ pub async fn serve() -> Result<(), String> {
                             response(&id, json!({
                                 "protocolVersion": PROTOCOL_VERSION,
                                 "serverInfo": {"name":"jan","version":env!("CARGO_PKG_VERSION")},
-                                "capabilities": {"session":true,"turn":true},
+                                "capabilities": {"session":true,"turn":true,"compaction":true},
                                 "input_content_parts": super::run_report::InputContentParts::current(),
                             }))
                         }
@@ -716,6 +752,52 @@ pub async fn serve() -> Result<(), String> {
                             let session = sessions.get_mut(&sid).expect("checked");
                             session.history.clear();
                             response(&id, tools_view(session).await)
+                        }
+                    },
+                    "session/compact" => match serde_json::from_value::<SessionIdParams>(params.clone()) {
+                        Err(_) => error(&id, -32602, "session/compact requires sessionId"),
+                        Ok(SessionIdParams { session_id: sid }) if !sessions.contains_key(&sid) => error(&id, -32602, UNKNOWN_SESSION),
+                        Ok(SessionIdParams { session_id: sid }) if active.as_ref().is_some_and(|t| t.session_id == sid) => turn_active(&id),
+                        Ok(SessionIdParams { session_id: sid }) => {
+                            let started = StreamEvent::Compaction {
+                                phase: CompactionPhase::Started,
+                                reason: CompactionReason::Manual,
+                                messages: None,
+                            };
+                            let wire = serde_json::to_value(&started).map_err(|e| e.to_string())?;
+                            notify(&out, "item/compaction", json!({"sessionId":sid,"event":wire}))?;
+
+                            let outcome = {
+                                let session = sessions.get_mut(&sid).expect("checked");
+                                compact_session(session).await
+                            };
+                            match outcome {
+                                Ok(messages) => {
+                                    let updated = StreamEvent::MessagesUpdated {
+                                        messages: sessions.get(&sid).expect("checked").history.clone(),
+                                    };
+                                    let wire = serde_json::to_value(&updated).map_err(|e| e.to_string())?;
+                                    notify(&out, "item/messages_updated", json!({"sessionId":sid,"event":wire}))?;
+                                    let finished = StreamEvent::Compaction {
+                                        phase: CompactionPhase::Finished,
+                                        reason: CompactionReason::Manual,
+                                        messages: Some(messages),
+                                    };
+                                    let wire = serde_json::to_value(&finished).map_err(|e| e.to_string())?;
+                                    notify(&out, "item/compaction", json!({"sessionId":sid,"event":wire}))?;
+                                    response(&id, json!({"sessionId":sid,"compacted":messages > 0,"messages":messages}))
+                                }
+                                Err(message) => {
+                                    let failed = StreamEvent::Compaction {
+                                        phase: CompactionPhase::Failed,
+                                        reason: CompactionReason::Manual,
+                                        messages: None,
+                                    };
+                                    let wire = serde_json::to_value(&failed).map_err(|e| e.to_string())?;
+                                    notify(&out, "item/compaction", json!({"sessionId":sid,"event":wire}))?;
+                                    error_data(&id, -32000, &message, json!({"kind":"compaction_failed"}))
+                                }
+                            }
                         }
                     },
                     "tool/respond" => match serde_json::from_value::<ToolRespondParams>(params.clone()) {

@@ -37,6 +37,8 @@ pub enum CompactionPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionReason {
+    /// The host explicitly requested compaction between turns.
+    Manual,
     /// The request about to be sent was over the window's trigger.
     Preflight,
     /// The provider rejected a request as too long for its window.
