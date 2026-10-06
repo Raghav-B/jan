@@ -9878,6 +9878,9 @@ pub async fn run(
         mut args,
         permission_requests,
         model,
+        // The interactive TUI owns its mutable effort selector. The headless
+        // environment setting applies to `agent run` and RPC hosts only.
+        reasoning_effort: _,
         // Re-resolved from `App` as the model changes, so the session's initial
         // answer is not carried into the picker's later selections.
         provider: _,

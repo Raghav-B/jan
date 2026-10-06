@@ -1453,6 +1453,13 @@ pub(crate) struct AgentSession {
     pub args: OrchestrationArgs,
     pub permission_requests: PermissionRegistry,
     pub model: String,
+    /// Headless reasoning effort applied to every request in this process.
+    ///
+    /// The interactive TUI owns a mutable effort selector, but `agent run`
+    /// and RPC hosts have no UI. `JAN_REASONING_EFFORT` gives those surfaces
+    /// one explicit, fail-closed setting instead of silently inheriting a
+    /// provider default that the host cannot verify.
+    pub reasoning_effort: Option<String>,
     /// The provider that will serve `model`, when one offers it. Carried so the
     /// per-provider cached window and prices are read under the provider that
     /// is actually billed, rather than whichever one the catalog finds first.
@@ -1496,6 +1503,7 @@ fn request_body(
     model: &str,
     limits: &SessionLimits,
     send_reasoning: bool,
+    reasoning_effort: Option<&str>,
     messages: serde_json::Value,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -1530,14 +1538,43 @@ fn request_body(
     // Reasoning resend policy: the request-level flag the loop reads to
     // decide whether prior assistant `reasoning_content` goes back out.
     body["send_reasoning"] = serde_json::json!(send_reasoning);
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = serde_json::json!(effort);
+    }
     body
 }
 
 impl AgentSession {
     /// Build a streaming request body for the given conversation history.
     pub(crate) fn body(&self, messages: serde_json::Value) -> serde_json::Value {
-        request_body(&self.model, &self.limits, self.send_reasoning, messages)
+        request_body(
+            &self.model,
+            &self.limits,
+            self.send_reasoning,
+            self.reasoning_effort.as_deref(),
+            messages,
+        )
     }
+}
+
+fn parse_headless_reasoning_effort(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    match normalized.as_str() {
+        "low" | "medium" | "high" | "xhigh" | "max" => Ok(Some(normalized)),
+        _ => Err(format!(
+            "JAN_REASONING_EFFORT must be one of low, medium, high, xhigh, or max (got {raw:?})"
+        )),
+    }
+}
+
+fn headless_reasoning_effort() -> Result<Option<String>, String> {
+    parse_headless_reasoning_effort(std::env::var("JAN_REASONING_EFFORT").ok().as_deref())
 }
 
 /// The per-invocation switches a session starts with.
@@ -1912,10 +1949,13 @@ fn prepare_agent_session(
         &model,
     )?;
 
+    let reasoning_effort = headless_reasoning_effort()?;
+
     Ok(AgentSession {
         args,
         permission_requests,
         model,
+        reasoning_effort,
         provider: serving_provider,
         smol_model,
         limits: SessionLimits {
@@ -5076,7 +5116,7 @@ mod tests {
     fn run_limits_reach_the_request_body() {
         let messages = serde_json::json!([]);
 
-        let unset = request_body("m", &limits_with(None, 128_000), true, messages.clone());
+        let unset = request_body("m", &limits_with(None, 128_000), true, None, messages.clone());
         assert!(
             unset.get("max_turns").is_none(),
             "an unset cap must not write the field at all: {unset}"
@@ -5084,17 +5124,50 @@ mod tests {
         assert_eq!(unset["max_session_tokens"], 128_000);
 
         // What `agent step` pins, and what `--max-turns 5` pins, by the same route.
-        let stepped = request_body("m", &limits_with(Some(1), 128_000), true, messages.clone());
+        let stepped = request_body("m", &limits_with(Some(1), 128_000), true, None, messages.clone());
         assert_eq!(stepped["max_turns"], 1);
-        let capped = request_body("m", &limits_with(Some(5), 20_000), true, messages.clone());
+        let capped = request_body("m", &limits_with(Some(5), 20_000), true, None, messages.clone());
         assert_eq!(capped["max_turns"], 5);
         assert_eq!(capped["max_session_tokens"], 20_000);
 
         // An explicit 0 is the engine's "unbounded" encoding and must survive as
         // itself rather than being dropped back to the absent case.
-        let zero = request_body("m", &limits_with(Some(0), 0), true, messages);
+        let zero = request_body("m", &limits_with(Some(0), 0), true, None, messages);
         assert_eq!(zero["max_turns"], 0);
         assert_eq!(zero["max_session_tokens"], 0);
+    }
+
+    #[test]
+    fn headless_reasoning_effort_reaches_the_request_body() {
+        let body = request_body(
+            "openai/gpt-5.6-terra",
+            &limits_with(None, 1_050_000),
+            true,
+            Some("high"),
+            serde_json::json!([]),
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+
+        let unset = request_body(
+            "openai/gpt-5.6-terra",
+            &limits_with(None, 1_050_000),
+            true,
+            None,
+            serde_json::json!([]),
+        );
+        assert!(unset.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn headless_reasoning_effort_is_normalized_and_fail_closed() {
+        assert_eq!(
+            parse_headless_reasoning_effort(Some(" HIGH ")).unwrap(),
+            Some("high".to_string())
+        );
+        assert_eq!(parse_headless_reasoning_effort(Some("  ")).unwrap(), None);
+        assert!(parse_headless_reasoning_effort(Some("maximum"))
+            .unwrap_err()
+            .contains("must be one of"));
     }
 
     /// The contract a launcher checks before relying on any of this: the
