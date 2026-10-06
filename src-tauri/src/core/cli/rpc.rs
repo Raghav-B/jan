@@ -20,7 +20,9 @@ use super::{
     agent_dir_for, cli_save_thread, load_resume_history, prepare_agent_session, AgentSession,
     ResumeRequest, ResumeTarget, SessionFlags,
 };
-use crate::core::agent::events::{CompactionPhase, CompactionReason, StreamEvent, PROTOCOL_VERSION};
+use crate::core::agent::events::{
+    CompactionPhase, CompactionReason, StreamEvent, PROTOCOL_VERSION,
+};
 use crate::core::agent::host_tools::{HostToolDecl, HostToolResult, HostToolSet};
 use crate::core::agent::r#loop::{compact_history, run_orchestration_steered, SteeringRequest};
 
@@ -42,13 +44,14 @@ struct Session {
     subagents: bool,
 }
 
-fn prepare_rpc_session(
+async fn prepare_rpc_session(
     start: SessionStartParams,
     host_tools: HostToolSet,
 ) -> Result<Session, String> {
-    let resume = start.resume_session_id.as_ref().map(|session_id| {
-        ResumeRequest::resume(ResumeTarget::Id(session_id.clone()))
-    });
+    let resume = start
+        .resume_session_id
+        .as_ref()
+        .map(|session_id| ResumeRequest::resume(ResumeTarget::Id(session_id.clone())));
     let mut agent = prepare_agent_session(
         &start.cwd,
         start.model,
@@ -60,6 +63,31 @@ fn prepare_rpc_session(
         },
         resume.as_ref(),
     )?;
+    // `prepare_agent_session` connects active MCP servers in the background.
+    // RPC returns the session's tool snapshot in `session/start`, so that
+    // snapshot must not race the connection task. A host that receives an
+    // early, built-ins-only list has no later signal that the missing tools
+    // became available and will run the entire persisted session without
+    // them.
+    if let Some(task) = agent.mcp_task.take() {
+        match task.await {
+            Ok(outcome) => {
+                if !outcome.connected.is_empty() {
+                    log::info!("MCP: connected {}", outcome.connected.join(", "));
+                }
+                for failure in &outcome.failed {
+                    log::warn!("MCP: {failure}");
+                }
+                if !outcome.needs_auth.is_empty() {
+                    log::warn!(
+                        "MCP: {} need authentication - run `jan` and use /mcp to sign in",
+                        outcome.needs_auth.join(", ")
+                    );
+                }
+            }
+            Err(error) => log::warn!("MCP connect task failed: {error}"),
+        }
+    }
     let resumed = match resume.as_ref() {
         Some(request) => {
             let project = agent
@@ -140,7 +168,11 @@ fn response(id: &Value, result: Value) -> Value {
 }
 
 fn error(id: &Value, code: i32, message: &str) -> Value {
-    let data = if code == -32001 { json!({"retryable":true}) } else { Value::Null };
+    let data = if code == -32001 {
+        json!({"retryable":true})
+    } else {
+        Value::Null
+    };
     error_data(id, code, message, data)
 }
 
@@ -175,14 +207,18 @@ fn declare_tools(entries: Vec<Value>) -> Result<HostToolSet, String> {
         .into_iter()
         .enumerate()
         .map(|(index, entry)| {
-            serde_json::from_value::<HostToolDecl>(entry).map_err(|e| format!("tools[{index}]: {e}"))
+            serde_json::from_value::<HostToolDecl>(entry)
+                .map_err(|e| format!("tools[{index}]: {e}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     HostToolSet::declare(decls).map_err(|e| e.to_string())
 }
 
 fn host_names(set: &HostToolSet) -> Vec<String> {
-    set.all().iter().map(|tool| tool.qualified_name.clone()).collect()
+    set.all()
+        .iter()
+        .map(|tool| tool.qualified_name.clone())
+        .collect()
 }
 
 /// What the session's next turn advertises, and the host schemas among it.
@@ -232,14 +268,24 @@ fn check_result_parts(parts: &[Value]) -> Result<String, String> {
 }
 
 fn host_result(params: ToolRespondParams) -> Result<(String, HostToolResult), String> {
-    let ToolRespondParams { request_id, content, is_error, details } = params;
+    let ToolRespondParams {
+        request_id,
+        content,
+        is_error,
+        details,
+    } = params;
     let (content, parts) = match content {
         ToolResultContent::Text(text) => (text, None),
         ToolResultContent::Parts(parts) => (check_result_parts(&parts)?, Some(parts)),
     };
     Ok((
         request_id,
-        HostToolResult { content, parts, details: details.map(Value::Object), is_error },
+        HostToolResult {
+            content,
+            parts,
+            details: details.map(Value::Object),
+            is_error,
+        },
     ))
 }
 
@@ -255,7 +301,9 @@ async fn release_host_requests(
     reason: &str,
     out: &mpsc::Sender<Value>,
 ) -> Result<(), String> {
-    let Some(session) = session else { return Ok(()) };
+    let Some(session) = session else {
+        return Ok(());
+    };
     let registry = &session.agent.args.host_tool_requests;
     let released = if reason == "client_gone" {
         crate::core::agent::host_tools::strand_all(registry).await
@@ -263,13 +311,20 @@ async fn release_host_requests(
         crate::core::agent::host_tools::cancel_all(registry).await
     };
     for request_id in released {
-        let event = StreamEvent::ToolRequestCancelled { request_id, reason: reason.to_owned() };
+        let event = StreamEvent::ToolRequestCancelled {
+            request_id,
+            reason: reason.to_owned(),
+        };
         let wire = serde_json::to_value(&event).map_err(|e| e.to_string())?;
         let params = json!({"sessionId":turn.session_id,"turnId":turn.turn_id,"event":wire});
         if reason == "client_gone" {
             let _ = notify(out, "item/tool_request_cancelled", params);
         } else {
-            send_reply(out, json!({"jsonrpc":"2.0","method":"item/tool_request_cancelled","params":params})).await?;
+            send_reply(
+                out,
+                json!({"jsonrpc":"2.0","method":"item/tool_request_cancelled","params":params}),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -473,7 +528,10 @@ fn rebuild_agent(source: &Session, model: Option<String>) -> Result<AgentSession
         &project.to_string_lossy(),
         Some(model.unwrap_or_else(|| source.agent.model.clone())),
         ProviderOverrides::default(),
-        SessionFlags { require_model: true, ..Default::default() },
+        SessionFlags {
+            require_model: true,
+            ..Default::default()
+        },
         None,
     )?;
     agent.args.session_id = Some(source.id.clone());
@@ -524,9 +582,12 @@ fn finish_turn(
                 Some(&session.id),
                 &session.agent.model,
                 &session.history,
-                session.agent.args.host_system_prompt.as_ref().map(|prompt| {
-                    json!({ super::SYSTEM_PROMPT_KEY: prompt })
-                }),
+                session
+                    .agent
+                    .args
+                    .host_system_prompt
+                    .as_ref()
+                    .map(|prompt| json!({ super::SYSTEM_PROMPT_KEY: prompt })),
             ) {
                 error_message = Some(format!("could not save session: {message}"));
             }
@@ -571,9 +632,12 @@ async fn compact_session(session: &mut Session) -> Result<usize, String> {
             Some(&session.id),
             &session.agent.model,
             &compacted,
-            session.agent.args.host_system_prompt.as_ref().map(|prompt| {
-                json!({ super::SYSTEM_PROMPT_KEY: prompt })
-            }),
+            session
+                .agent
+                .args
+                .host_system_prompt
+                .as_ref()
+                .map(|prompt| json!({ super::SYSTEM_PROMPT_KEY: prompt })),
         )?;
     }
 
@@ -660,7 +724,7 @@ pub async fn serve() -> Result<(), String> {
                             // host got wrong is refused before anything is spent.
                             Ok(start) => match declare_tools(start.tools.clone()) {
                                 Err(message) => invalid_tools(&id, &message),
-                                Ok(host_tools) => match prepare_rpc_session(start, host_tools) {
+                                Ok(host_tools) => match prepare_rpc_session(start, host_tools).await {
                                     Ok(session) => {
                                         let sid = session.id.clone();
                                         let mut result = tools_view(&session).await;
@@ -1020,16 +1084,16 @@ mod tests {
     use crate::core::cli::stream_input::{MAX_IMAGES, MAX_IMAGE_BYTES};
 
     /// What the runner does: pump while the engine runs, then drain the rest.
-    async fn relay(
-        burst: usize,
-        events: mpsc::Sender<TurnMessage>,
-    ) -> Result<Value, String> {
+    async fn relay(burst: usize, events: mpsc::Sender<TurnMessage>) -> Result<Value, String> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         // Bursts of 50 with a yield between them: some are relayed while the
         // engine is still running, the last is drained after it returns.
         let engine = async {
             for i in 0..burst {
-                tx.send(StreamEvent::Token { text: i.to_string() }).unwrap();
+                tx.send(StreamEvent::Token {
+                    text: i.to_string(),
+                })
+                .unwrap();
                 if i % 50 == 49 {
                     tokio::task::yield_now().await;
                 }
@@ -1080,7 +1144,15 @@ mod tests {
     fn a_text_result_is_the_whole_answer() {
         let (id, result) = host_result(respond_params(json!("moved"))).unwrap();
         assert_eq!(id, "host-1");
-        assert_eq!(result, HostToolResult { content: "moved".into(), parts: None, details: None, is_error: false });
+        assert_eq!(
+            result,
+            HostToolResult {
+                content: "moved".into(),
+                parts: None,
+                details: None,
+                is_error: false
+            }
+        );
     }
 
     /// Parts pass through verbatim; the text summary is what hooks and the
@@ -1090,7 +1162,8 @@ mod tests {
         let parts = json!([{"type":"text","text":"a"},image(3),{"type":"text","text":"b"}]);
         let params: ToolRespondParams = serde_json::from_value(json!({
             "requestId":"host-1","content":parts,"isError":true,"details":{"k":1}
-        })).unwrap();
+        }))
+        .unwrap();
         let (_, result) = host_result(params).unwrap();
         assert_eq!(result.content, "a\nb");
         assert_eq!(Value::Array(result.parts.unwrap()), parts);
@@ -1104,19 +1177,30 @@ mod tests {
         // at the cap is its largest multiple of 3.
         let at_cap = MAX_IMAGE_BYTES / 3 * 3;
         assert!(check_result_parts(&[image(at_cap)]).is_ok());
-        assert!(check_result_parts(&[image(at_cap + 3)]).unwrap_err().contains("byte cap"));
-        assert!(check_result_parts(&vec![image(3); MAX_IMAGES + 1]).unwrap_err().contains("images"));
-        assert!(check_result_parts(&vec![image(at_cap); 3]).unwrap_err().contains("total"));
+        assert!(check_result_parts(&[image(at_cap + 3)])
+            .unwrap_err()
+            .contains("byte cap"));
+        assert!(check_result_parts(&vec![image(3); MAX_IMAGES + 1])
+            .unwrap_err()
+            .contains("images"));
+        assert!(check_result_parts(&vec![image(at_cap); 3])
+            .unwrap_err()
+            .contains("total"));
         assert!(check_result_parts(&[]).is_err());
         assert!(check_result_parts(&[json!({"type":"text","text":" "})]).is_err());
-        assert!(check_result_parts(&[json!({"type":"audio"})]).unwrap_err().contains("audio"));
+        assert!(check_result_parts(&[json!({"type":"audio"})])
+            .unwrap_err()
+            .contains("audio"));
         let bmp = json!({"type":"image_url","image_url":{"url":"data:image/bmp;base64,AA=="}});
         assert!(check_result_parts(&[bmp]).is_err());
     }
 
     #[test]
     fn content_that_is_neither_text_nor_parts_is_a_params_error() {
-        assert!(serde_json::from_value::<ToolRespondParams>(json!({"requestId":"h","content":7})).is_err());
+        assert!(
+            serde_json::from_value::<ToolRespondParams>(json!({"requestId":"h","content":7}))
+                .is_err()
+        );
         assert!(serde_json::from_value::<ToolRespondParams>(json!({"requestId":"h"})).is_err());
     }
 
@@ -1124,8 +1208,12 @@ mod tests {
     fn a_declaration_error_names_the_entry_or_the_rule() {
         let set = declare_tools(vec![json!({"name":"camera","capability":"read"})]).unwrap();
         assert_eq!(host_names(&set), ["host__camera"]);
-        assert!(declare_tools(vec![json!({"name":"bash"})]).unwrap_err().contains("reserved"));
-        assert!(declare_tools(vec![json!({"name":"a"}), json!(3)]).unwrap_err().starts_with("tools[1]"));
+        assert!(declare_tools(vec![json!({"name":"bash"})])
+            .unwrap_err()
+            .contains("reserved"));
+        assert!(declare_tools(vec![json!({"name":"a"}), json!(3)])
+            .unwrap_err()
+            .starts_with("tools[1]"));
         assert!(declare_tools(Vec::new()).unwrap().is_empty());
     }
 
@@ -1136,26 +1224,38 @@ mod tests {
         assert_eq!(start.resume_session_id, None);
         assert!(!start.auto_approve);
         assert_eq!(start.permissions, PermissionOwner::Jan);
-        let host: SessionStartParams = serde_json::from_value(json!({"cwd":"/","permissions":"host","builtins":false})).unwrap();
+        let host: SessionStartParams =
+            serde_json::from_value(json!({"cwd":"/","permissions":"host","builtins":false}))
+                .unwrap();
         assert_eq!(host.permissions, PermissionOwner::Host);
         assert!(!host.builtins);
         let resumed: SessionStartParams = serde_json::from_value(json!({
             "cwd":"/","resumeSessionId":"thread-1","autoApprove":true
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(resumed.resume_session_id.as_deref(), Some("thread-1"));
         assert!(resumed.auto_approve);
-        assert!(serde_json::from_value::<SessionStartParams>(json!({"cwd":"/","permissions":"nobody"})).is_err());
+        assert!(serde_json::from_value::<SessionStartParams>(
+            json!({"cwd":"/","permissions":"nobody"})
+        )
+        .is_err());
     }
 
     #[test]
     fn mutation_refusals_carry_their_kind() {
         let busy = turn_active(&json!(1));
         assert_eq!(busy["error"]["code"], -32001);
-        assert_eq!(busy["error"]["data"], json!({"retryable":true,"kind":"turn_active"}));
+        assert_eq!(
+            busy["error"]["data"],
+            json!({"retryable":true,"kind":"turn_active"})
+        );
         let bad = invalid_tools(&json!(1), "x");
         assert_eq!(bad["error"]["data"], json!({"kind":"invalid_tools"}));
         // The plain helper is unchanged: -32001 is retryable, others carry no data.
-        assert_eq!(error(&json!(1), -32001, "m")["error"]["data"], json!({"retryable":true}));
+        assert_eq!(
+            error(&json!(1), -32001, "m")["error"]["data"],
+            json!({"retryable":true})
+        );
         assert!(error(&json!(1), -32602, "m")["error"]["data"].is_null());
     }
 }
