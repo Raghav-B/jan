@@ -79,6 +79,14 @@
             "null"
           ]
         },
+        "resumeSessionId": {
+          "description": "Resume a persisted CLI/RPC thread from this project. The server loads\nthe saved history before accepting the session, so process restarts do\nnot turn a valid continuation into a blank conversation.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "ephemeral": {
           "type": "boolean",
           "default": false

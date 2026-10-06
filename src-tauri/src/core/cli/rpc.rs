@@ -16,7 +16,10 @@ use super::rpc_schema::{
     ToolResultContent, TurnStartParams, TurnSteerParams,
 };
 use super::stream_input::{parse_input_line, MAX_LINE_BYTES};
-use super::{agent_dir_for, cli_save_thread, prepare_agent_session, AgentSession, SessionFlags};
+use super::{
+    agent_dir_for, cli_save_thread, load_resume_history, prepare_agent_session, AgentSession,
+    ResumeRequest, ResumeTarget, SessionFlags,
+};
 use crate::core::agent::events::{StreamEvent, PROTOCOL_VERSION};
 use crate::core::agent::host_tools::{HostToolDecl, HostToolResult, HostToolSet};
 use crate::core::agent::r#loop::{run_orchestration_steered, SteeringRequest};
@@ -37,6 +40,63 @@ struct Session {
     /// `subagents_enabled`; kept here because a rebuilt agent starts from the
     /// project default and has to be told again.
     subagents: bool,
+}
+
+fn prepare_rpc_session(
+    start: SessionStartParams,
+    host_tools: HostToolSet,
+) -> Result<Session, String> {
+    let resume = start.resume_session_id.as_ref().map(|session_id| {
+        ResumeRequest::resume(ResumeTarget::Id(session_id.clone()))
+    });
+    let mut agent = prepare_agent_session(
+        &start.cwd,
+        start.model,
+        ProviderOverrides::default(),
+        SessionFlags {
+            require_model: true,
+            ..Default::default()
+        },
+        resume.as_ref(),
+    )?;
+    let resumed = match resume.as_ref() {
+        Some(request) => {
+            let project = agent
+                .args
+                .project_root
+                .as_ref()
+                .expect("prepared session has a project root");
+            Some(load_resume_history(&agent_dir_for(project), request)?)
+        }
+        None => None,
+    };
+
+    agent.args.host_tools = host_tools;
+    agent.args.host_owns_gate = start.permissions == PermissionOwner::Host;
+    // "Not saved" covers project memory too: an ephemeral session's answers
+    // must not reach a later session.
+    agent.args.project_memory = !start.ephemeral;
+    let subagents = start.subagents.unwrap_or(start.builtins);
+    agent.args.subagents_enabled = subagents;
+    agent.args.host_system_prompt = start.system_prompt;
+    let id = resumed
+        .as_ref()
+        .map(|session| session.thread_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // The run reports the session by the id this client holds, not by the
+    // private one the agent was built with. Provenance and correlation must
+    // remain addressable by the same handle across a process restart.
+    agent.args.session_id = Some(id.clone());
+
+    Ok(Session {
+        agent,
+        history: resumed.map(|session| session.history).unwrap_or_default(),
+        id,
+        turns: 0,
+        ephemeral: start.ephemeral,
+        builtins: start.builtins,
+        subagents,
+    })
 }
 
 /// The allowlist a host-only session's turns run under, or `None` for a
@@ -554,31 +614,18 @@ pub async fn serve() -> Result<(), String> {
                         match serde_json::from_value::<SessionStartParams>(params.clone()) {
                             Err(_) => error(&id, -32602, "session/start requires cwd and supported options"),
                             Ok(start) if !std::path::Path::new(&start.cwd).is_dir() => error(&id, -32602, "cwd is not a directory"),
+                            Ok(start) if start.resume_session_id.as_deref().is_some_and(|sid| sid.trim().is_empty()) => error(&id, -32602, "resumeSessionId must not be blank"),
                             // A blank prompt is almost certainly a host bug (an unset
                             // template), and sending it would run a model with no
                             // instructions at all rather than with Jan's.
                             Ok(start) if start.system_prompt.as_deref().is_some_and(|p| p.trim().is_empty()) => error(&id, -32602, "systemPrompt must not be blank; omit it to use Jan's"),
                             // Declared before the session is built: a tool set the
                             // host got wrong is refused before anything is spent.
-                            Ok(start) => match declare_tools(start.tools) {
+                            Ok(start) => match declare_tools(start.tools.clone()) {
                                 Err(message) => invalid_tools(&id, &message),
-                                Ok(host_tools) => match prepare_agent_session(&start.cwd, start.model, ProviderOverrides::default(), SessionFlags { require_model: true, ..Default::default() }, None) {
-                                    Ok(mut agent) => {
-                                        agent.args.host_tools = host_tools;
-                                        agent.args.host_owns_gate = start.permissions == PermissionOwner::Host;
-                                        // "Not saved" covers project memory too: an ephemeral
-                                        // session's answers must not reach a later session.
-                                        agent.args.project_memory = !start.ephemeral;
-                                        let subagents = start.subagents.unwrap_or(start.builtins);
-                                        agent.args.subagents_enabled = subagents;
-                                        agent.args.host_system_prompt = start.system_prompt;
-                                        let sid = uuid::Uuid::new_v4().to_string();
-                                        // The run reports the session by the id this client holds, not
-                                        // by the private one the agent was built with: provenance and the
-                                        // correlation id are the client's handle on the session, and an id
-                                        // nothing else can name is not a handle.
-                                        agent.args.session_id = Some(sid.clone());
-                                        let session = Session { agent, history: Vec::new(), id: sid.clone(), turns: 0, ephemeral: start.ephemeral, builtins: start.builtins, subagents };
+                                Ok(host_tools) => match prepare_rpc_session(start, host_tools) {
+                                    Ok(session) => {
+                                        let sid = session.id.clone();
                                         let mut result = tools_view(&session).await;
                                         result["sessionId"] = json!(sid);
                                         result["model"] = json!(session.agent.model);
@@ -1003,10 +1050,15 @@ mod tests {
     fn session_start_defaults_keep_today_s_behaviour() {
         let start: SessionStartParams = serde_json::from_value(json!({"cwd":"/"})).unwrap();
         assert!(start.tools.is_empty() && start.builtins);
+        assert_eq!(start.resume_session_id, None);
         assert_eq!(start.permissions, PermissionOwner::Jan);
         let host: SessionStartParams = serde_json::from_value(json!({"cwd":"/","permissions":"host","builtins":false})).unwrap();
         assert_eq!(host.permissions, PermissionOwner::Host);
         assert!(!host.builtins);
+        let resumed: SessionStartParams = serde_json::from_value(json!({
+            "cwd":"/","resumeSessionId":"thread-1"
+        })).unwrap();
+        assert_eq!(resumed.resume_session_id.as_deref(), Some("thread-1"));
         assert!(serde_json::from_value::<SessionStartParams>(json!({"cwd":"/","permissions":"nobody"})).is_err());
     }
 
