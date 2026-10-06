@@ -42,6 +42,10 @@ pub struct SessionStartParams {
     /// not turn a valid continuation into a blank conversation.
     #[serde(default)]
     pub resume_session_id: Option<String>,
+    /// Approve Jan's built-in and MCP permission gates automatically for this
+    /// session. Defaults off; unattended hosts must opt in explicitly.
+    #[serde(default)]
+    pub auto_approve: bool,
     #[serde(default)]
     pub ephemeral: bool,
     /// Host tools this session may call. Kept as raw values until declaration

@@ -55,6 +55,7 @@ fn prepare_rpc_session(
         ProviderOverrides::default(),
         SessionFlags {
             require_model: true,
+            auto_approve: start.auto_approve,
             ..Default::default()
         },
         resume.as_ref(),
@@ -1051,14 +1052,16 @@ mod tests {
         let start: SessionStartParams = serde_json::from_value(json!({"cwd":"/"})).unwrap();
         assert!(start.tools.is_empty() && start.builtins);
         assert_eq!(start.resume_session_id, None);
+        assert!(!start.auto_approve);
         assert_eq!(start.permissions, PermissionOwner::Jan);
         let host: SessionStartParams = serde_json::from_value(json!({"cwd":"/","permissions":"host","builtins":false})).unwrap();
         assert_eq!(host.permissions, PermissionOwner::Host);
         assert!(!host.builtins);
         let resumed: SessionStartParams = serde_json::from_value(json!({
-            "cwd":"/","resumeSessionId":"thread-1"
+            "cwd":"/","resumeSessionId":"thread-1","autoApprove":true
         })).unwrap();
         assert_eq!(resumed.resume_session_id.as_deref(), Some("thread-1"));
+        assert!(resumed.auto_approve);
         assert!(serde_json::from_value::<SessionStartParams>(json!({"cwd":"/","permissions":"nobody"})).is_err());
     }
 
